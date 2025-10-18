@@ -2,3 +2,7 @@
 zasilka-TP4VGT9M89DDMFIM/*
 split_data/*
 data/*
+metadata/*
+data_sorted_timestamp/*
+data_sorted_timestamp_decrease_value/*
+pickles/*
