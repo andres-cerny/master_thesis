@@ -93,10 +93,12 @@ def add_periodicity_info(df, metadata):
 
     common_periodicity = time_diffs.mode().iloc[0]
 
-    gaps = time_diffs[(time_diffs > (common_periodicity + 300)) | (time_diffs < (common_periodicity - 300))].count()
+    gaps_5min = time_diffs[(time_diffs > (common_periodicity + 300)) | (time_diffs < (common_periodicity - 300))].count()
+    gaps_5percent = time_diffs[(time_diffs > common_periodicity * 1.05) | (time_diffs < common_periodicity * 0.95)].count()
 
     metadata['common_periodicity_seconds'] = common_periodicity
-    metadata['num_gaps_over_5min'] = int(gaps)
+    metadata['num_gaps_5min'] = int(gaps_5min)
+    metadata['num_gaps_5percent'] = int(gaps_5percent)
 
     return metadata
 
