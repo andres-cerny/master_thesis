@@ -161,16 +161,16 @@ if __name__ == '__main__':
     files = [f for f in os.listdir(input_folder) if f.endswith('.csv')]
     chunksize = len(files) // cpu_count() + 1
 
-    ## Create all base metadata (run once)
-    #with Pool(processes=cpu_count()) as pool:
-    #    for i, fname in enumerate(pool.imap_unordered(create_all_metadata, files, chunksize=chunksize)):
-    #        if i % 5000 == 0:
-    #            print(f"Created base metadata for {i} files")
-                
-                
-    # Add NaN or any other new metadata in parallel
+    # Create all base metadata (run once)
     with Pool(processes=cpu_count()) as pool:
-        augment_with_nans = partial(augment_metadata, augmentor=add_nan_counts)
-        for i, fname in enumerate(pool.imap_unordered(augment_with_nans, files, chunksize=chunksize)):
+        for i, fname in enumerate(pool.imap_unordered(create_all_metadata, files, chunksize=chunksize)):
             if i % 5000 == 0:
-                print(f"Augmented metadata for {i} files")
+                print(f"Created base metadata for {i} files")
+                
+                
+    ## Add NaN or any other new metadata in parallel
+    #with Pool(processes=cpu_count()) as pool:
+    #    augment_with_nans = partial(augment_metadata, augmentor=add_nan_counts)
+    #    for i, fname in enumerate(pool.imap_unordered(augment_with_nans, files, chunksize=chunksize)):
+    #        if i % 5000 == 0:
+    #            print(f"Augmented metadata for {i} files")
