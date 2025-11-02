@@ -74,13 +74,17 @@ def process_file(filepath):
 
     df['Diff'] = df['hodnota'].diff()
     df['Diff'] = df['Diff'].fillna(0)
-    #df.loc[df['Diff'] < -0.002, 'Diff'] = 0 # maybe exclude
-    df.loc[df['Diff'] < 0, 'Diff'] = np.nan
+    # This is for metadata_001 (we allow 0.001 negative difference and set it to 0)
+    # Set Diff to np.nan where it is smaller than -0.002
+    df.loc[df['Diff'] <= -0.002, 'Diff'] = np.nan
+    df.loc[(df['Diff'] > -0.002) & (df['Diff'] < 0), 'Diff'] = 0 
+    # This is for metadata
+    #df.loc[df['Diff'] < 0, 'Diff'] = np.nan
 
     df.to_csv(filepath, index=False)
 
 
-def calculate_diff_multithreaded(folder="./data_sorted_timestamp", max_workers=8):
+def calculate_diff_multithreaded(folder="./data_w_diff_001", max_workers=8):
     '''
     Calculate Diff values from Values in all CSV files in the specified folder using multithreading.
     Adds 'Diff' column, replacing negative differences with NaN,

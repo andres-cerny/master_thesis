@@ -3,7 +3,12 @@ zasilka-TP4VGT9M89DDMFIM/*
 split_data/*
 data/*
 metadata/*
+metadata_001/*
 data_sorted_timestamp/*
 data_sorted_timestamp_decrease_value/*
 pickles/*
 data_sorted_timestamp_diff_002/*
+data_w_diff/*
+data_w_diff_001/*
+__pycache__/*
+__pycache__

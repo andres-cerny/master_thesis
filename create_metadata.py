@@ -7,8 +7,8 @@ from multiprocessing import Pool, cpu_count
 from statsmodels.tsa.stattools import acf
 from functools import partial
 
-input_folder = './data_sorted_timestamp'
-metadata_folder = './metadata'
+input_folder = './data_w_diff_001'
+metadata_folder = './metadata_001'
 os.makedirs(metadata_folder, exist_ok=True)
 
 # Base metadata generation (only if you want to regenerate all)
@@ -91,18 +91,22 @@ def add_periodicity_info(df, metadata):
     if time_diffs.empty:
         # If single reading or no diff, set periodicity as None and gaps as 0
         metadata['common_periodicity_seconds'] = None
+        metadata['common_periodicity_top_10'] = None
         metadata['num_gaps_5min'] = 0
         metadata['num_gaps_10percent'] = 0
         metadata['proportion_of_gaps_5min'] = 0
         metadata['proportion_of_gaps_10percent'] = 0
         return metadata
 
-    common_periodicity = time_diffs.mode().iloc[0]
+    common_periodicity_mode= time_diffs.mode()
+    common_periodicity_top_10 = common_periodicity_mode[:10].tolist()
+    common_periodicity = common_periodicity_mode.iloc[0]
 
     gaps_5min = time_diffs[(time_diffs > (common_periodicity + 300)) | (time_diffs < (common_periodicity - 300))].count()
     gaps_10percent = time_diffs[(time_diffs > common_periodicity * 1.1) | (time_diffs < common_periodicity * 0.90)].count()
 
     metadata['common_periodicity_seconds'] = common_periodicity
+    metadata['common_periodicity_top_10'] = common_periodicity_top_10
     metadata['num_gaps_5min'] = int(gaps_5min)
     metadata['num_gaps_10percent'] = int(gaps_10percent)
     metadata['proportion_of_gaps_5min'] = int(gaps_5min) / int(metadata["num_records"])
@@ -161,16 +165,16 @@ if __name__ == '__main__':
     files = [f for f in os.listdir(input_folder) if f.endswith('.csv')]
     chunksize = len(files) // cpu_count() + 1
 
-    # Create all base metadata (run once)
-    with Pool(processes=cpu_count()) as pool:
-        for i, fname in enumerate(pool.imap_unordered(create_all_metadata, files, chunksize=chunksize)):
-            if i % 5000 == 0:
-                print(f"Created base metadata for {i} files")
-                
-                
-    ## Add NaN or any other new metadata in parallel
+    ## Create all base metadata (run once)
     #with Pool(processes=cpu_count()) as pool:
-    #    augment_with_nans = partial(augment_metadata, augmentor=add_nan_counts)
-    #    for i, fname in enumerate(pool.imap_unordered(augment_with_nans, files, chunksize=chunksize)):
+    #    for i, fname in enumerate(pool.imap_unordered(create_all_metadata, files, chunksize=chunksize)):
     #        if i % 5000 == 0:
-    #            print(f"Augmented metadata for {i} files")
+    #            print(f"Created base metadata for {i} files")
+                
+                
+    # Add NaN or any other new metadata in parallel
+    with Pool(processes=cpu_count()) as pool:
+        augment_with_nans = partial(augment_metadata, augmentor=add_periodicity_info)
+        for i, fname in enumerate(pool.imap_unordered(augment_with_nans, files, chunksize=chunksize)):
+            if i % 5000 == 0:
+                print(f"Augmented metadata for {i} files")
