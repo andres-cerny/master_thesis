@@ -78,6 +78,7 @@ def augment_metadata(filename, augmentor):
 def add_nan_counts(df, metadata):
     metadata['nan_value_count'] = df['hodnota'].isna().sum()
     metadata['nan_diff_count'] = df['Diff'].isna().sum()
+    metadata['na_timestamp_utc_count'] = df['timestamp_utc'].isna().sum()
     return metadata
 
 def add_periodicity_info(df, metadata):
@@ -174,7 +175,7 @@ if __name__ == '__main__':
                 
     # Add NaN or any other new metadata in parallel
     with Pool(processes=cpu_count()) as pool:
-        augment_with_nans = partial(augment_metadata, augmentor=add_periodicity_info)
+        augment_with_nans = partial(augment_metadata, augmentor=add_nan_counts)
         for i, fname in enumerate(pool.imap_unordered(augment_with_nans, files, chunksize=chunksize)):
             if i % 5000 == 0:
                 print(f"Augmented metadata for {i} files")
