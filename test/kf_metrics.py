@@ -2,7 +2,6 @@ import numpy as np
 import pandas as pd
 from typing import Dict, Optional
 from scipy import stats
-from kf import WaterMeterKalmanFilter
 
 
 class KalmanFilterMetrics:

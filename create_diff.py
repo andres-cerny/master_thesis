@@ -75,7 +75,7 @@ def process_file(filepath):
     df['Diff'] = df['hodnota'].diff()
     df['Diff'] = df['Diff'].fillna(0)
     # This is for metadata_001 (we allow 0.001 negative difference and set it to 0)
-    # Set Diff to np.nan where it is smaller than -0.002
+    # Set Diff to np.nan where it is smaller than -0.001
     df.loc[df['Diff'] <= -0.002, 'Diff'] = np.nan
     df.loc[(df['Diff'] > -0.002) & (df['Diff'] < 0), 'Diff'] = 0 
     # This is for metadata
