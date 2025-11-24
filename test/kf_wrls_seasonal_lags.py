@@ -86,154 +86,13 @@ class KalmanFilterWRLSEstimatorSeasonalLags:
         self.R_matrix = None
         self.estimation_metadata = {}
     
-    def construct_state_vectors(self, 
-                                df: pd.DataFrame,
-                                expected_interval_seconds: float,
-                                seasonal_period_hours: float = 24.0,
-                                tolerance_percent: float = 10.0) -> Tuple[np.ndarray, pd.DataFrame, List[Tuple[np.ndarray, np.ndarray]]]:
-        """
-        Construct state vectors and valid state pairs from water consumption data.
-        
-        State vector structure:
-        [diff(t-1), diff(t-2), diff(t-3), ..., diff(t-n)]
-        
-        where n = seasonal_period_hours * 3600 / expected_interval_seconds
-        (e.g., 24 hours / 30 minutes = 48 components for daily seasonality)
-        
-        Parameters:
-        -----------
-        df : pd.DataFrame
-            DataFrame with columns ['timestamp', 'Value', 'Diff']
-            - 'timestamp': timestamp (may have gaps and irregular spacing)
-            - 'Value': cumulative meter reading
-            - 'Diff': consumption since last reading
-        expected_interval_seconds : float
-            Expected sampling interval in SECONDS (e.g., 1800 for 30 minutes)
-            Used as reference for filtering consecutive pairs
-        seasonal_period_hours : float, default=24.0
-            Seasonal period in hours (24.0 for daily seasonality)
-            Determines the number of lag components in state vector
-        tolerance_percent : float, default=10.0
-            Tolerance for time difference as percentage of expected interval
-            - Only keeps pairs where: expected_interval * (1 - tol/100) <= actual <= expected_interval * (1 + tol/100)
-            - Default 10% means ±10% tolerance
-        
-        Returns:
-        --------
-        state_sequence : np.ndarray
-            Array of shape (n_valid_points, state_dim) containing state vectors
-            for all valid (non-NaN) data points
-            state_dim = number of measurements per seasonal period
-        df_valid : pd.DataFrame
-            Cleaned dataframe with only valid (non-NaN) data points
-        valid_state_pairs : List[Tuple[np.ndarray, np.ndarray]]
-            List of (x_t, x_next) tuples for valid consecutive pairs
-            Each element is shape (state_dim, 1)
-        """
-        # Ensure datetime format
-        df = df.copy()
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        # Remove rows with NaN in Diff (missing/invalid consumption data)
-        df_valid = df.dropna(subset=['Diff']).reset_index(drop=True)
-        
-        if len(df_valid) == 0:
-            raise ValueError("No valid data points after removing NaN values")
-        
-        # Calculate state dimension based on seasonal period
-        measurements_per_period = int((seasonal_period_hours * 3600) / expected_interval_seconds)
-        state_dim = measurements_per_period
-        
-        if len(df_valid) < state_dim + 10:
-            warnings.warn(
-                f"Only {len(df_valid)} valid points for state dimension {state_dim}. "
-                f"Consider using more data or reducing seasonal_period_hours."
-            )
-        
-        # Calculate total time span and expected number of readings
-        time_span_seconds = (df_valid['timestamp'].iloc[-1] - df_valid['timestamp'].iloc[0]).total_seconds()
-        expected_num_readings = int(time_span_seconds / expected_interval_seconds) + 1
-        
-        # Calculate time differences between consecutive points (in seconds)
-        time_diffs_seconds = df_valid['timestamp'].diff().dt.total_seconds()
-        
-        # Calculate tolerance bounds
-        expected_interval_min = expected_interval_seconds * (1 - tolerance_percent / 100.0)
-        expected_interval_max = expected_interval_seconds * (1 + tolerance_percent / 100.0)
-        
-        # Extract diff values
-        diff_values = df_valid['Diff'].values
-        
-        # Create state vectors with seasonal lags
-        # state[i] = [diff[i], diff[i-1], diff[i-2], ..., diff[i-state_dim+1]]
-        n_points = len(diff_values)
-        n_valid_states = n_points - state_dim + 1
-        
-        if n_valid_states < 2:
-            raise ValueError(
-                f"Insufficient data for state construction. "
-                f"Need at least {state_dim + 1} points, have {n_points}. "
-                f"Consider reducing seasonal_period_hours or using more data."
-            )
-        
-        state_sequence = np.zeros((n_valid_states, state_dim))
-        
-        for i in range(n_valid_states):
-            # State vector: [diff(t), diff(t-1), ..., diff(t-state_dim+1)]
-            state_sequence[i, :] = diff_values[i:i+state_dim]
-        
-        # Construct valid state pairs
-        # For state_sequence[i] and state_sequence[i+1] to form a valid pair,
-        # the time difference between df_valid[i+state_dim-1] and df_valid[i+state_dim]
-        # must be within tolerance
-        valid_state_pairs = []
-        
-        for i in range(n_valid_states - 1):
-            # Check if transition from state i to state i+1 is valid
-            # This corresponds to time step from df_valid[i+state_dim-1] to df_valid[i+state_dim]
-            time_idx = i + state_dim
-            time_diff = time_diffs_seconds.iloc[time_idx]
-            
-            if expected_interval_min <= time_diff <= expected_interval_max:
-                x_t = state_sequence[i, :].reshape(-1, 1)      # (state_dim, 1)
-                x_next = state_sequence[i+1, :].reshape(-1, 1)  # (state_dim, 1)
-                valid_state_pairs.append((x_t, x_next))
-        
-        # Calculate validity percentage
-        n_valid_pairs = len(valid_state_pairs)
-        expected_num_pairs = expected_num_readings - state_dim  # Adjusted for state construction
-        
-        if expected_num_pairs > 0:
-            validity_percentage = (n_valid_pairs / expected_num_pairs) * 100
-        else:
-            validity_percentage = 0.0
-        
-        # Warn if validity is too low
-        if validity_percentage < 70.0:
-            warnings.warn(
-                f"Data quality warning: Only {validity_percentage:.1f}% of expected pairs are valid.\n"
-                f"  Expected pairs (based on time span): {expected_num_pairs}\n"
-                f"  Valid pairs found: {n_valid_pairs}\n"
-                f"  Missing/invalid: {expected_num_pairs - n_valid_pairs}\n"
-                f"  This may indicate significant NaN values, gaps, or irregular sampling."
-            )
-        
-        if len(valid_state_pairs) < 2:
-            raise ValueError(
-                f"Only {len(valid_state_pairs)} valid consecutive pairs found "
-                f"within tolerance {tolerance_percent}% of {expected_interval_seconds} seconds. "
-                f"Consider relaxing tolerance or checking data quality."
-            )
-        
-        return state_sequence, df_valid, valid_state_pairs
-    
     
     def construct_state_vectors(self, 
                                 df: pd.DataFrame,
                                 expected_interval_seconds: float,
                                 seasonal_period_hours: float = 24.0,
-                                tolerance_percent: float = 10.0) -> Tuple[np.ndarray, pd.DataFrame, List[Tuple[np.ndarray, np.ndarray]]]:
+                                tolerance_percent: float = 10.0,
+                                verbose: bool = False) -> Tuple[np.ndarray, pd.DataFrame, List[Tuple[np.ndarray, np.ndarray]]]:
         """
         Construct state vectors and valid state pairs from water consumption data.
         
@@ -352,7 +211,7 @@ class KalmanFilterWRLSEstimatorSeasonalLags:
             validity_percentage = 0.0
         
         # Warn if validity is too low
-        if validity_percentage < 70.0:
+        if validity_percentage < 70.0 and verbose:
             warnings.warn(
                 f"Data quality warning: Only {validity_percentage:.1f}% of expected pairs are valid.\n"
                 f"  Expected pairs (based on time span): {expected_num_pairs}\n"
@@ -426,7 +285,8 @@ class KalmanFilterWRLSEstimatorSeasonalLags:
             df,
             expected_interval_seconds,
             seasonal_period_hours,
-            tolerance_percent
+            tolerance_percent,
+            verbose
         )
         
         state_dim = state_sequence.shape[1]
@@ -699,21 +559,21 @@ class KalmanFilterWRLSEstimatorSeasonalLags:
         
         # Method 2: Look for stable periods (low variance windows)
         # Use the first component of state vectors (most recent diff)
-        current_diff = state_sequence[:, 0]
-        window_size = min(10, len(current_diff) // 4)
-        
-        if window_size >= 3:
-            rolling_std = pd.Series(current_diff).rolling(window=window_size).std()
-            stable_periods = rolling_std < rolling_std.quantile(0.25)  # Bottom 25% variance
-            
-            if stable_periods.sum() > 5:
-                stable_diff = current_diff[stable_periods]
-                sensor_noise_var = np.var(stable_diff)
-            else:
-                sensor_noise_var = overall_var * 0.1  # Use 10% of total variance
-        else:
-            sensor_noise_var = overall_var * 0.1
-        
+        #current_diff = state_sequence[:, 0]
+        #window_size = min(10, len(current_diff) // 4)
+        #
+        #if window_size >= 3:
+        #    rolling_std = pd.Series(current_diff).rolling(window=window_size).std()
+        #    stable_periods = rolling_std < rolling_std.quantile(0.25)  # Bottom 25% variance
+        #    
+        #    if stable_periods.sum() > 5:
+        #        stable_diff = current_diff[stable_periods]
+        #        sensor_noise_var = np.var(stable_diff)
+        #    else:
+        #        sensor_noise_var = overall_var * 0.1  # Use 10% of total variance
+        #else:
+        #    sensor_noise_var = overall_var * 0.1
+        sensor_noise_var = overall_var * 0.1
         # Construct R matrix as diagonal
         # All state components are diff measurements, so use same noise variance
         R = np.eye(state_dim) * sensor_noise_var

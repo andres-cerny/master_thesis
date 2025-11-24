@@ -3,3 +3,4 @@ test_venv/*
 graph1_indexed.csv
 graph2_indexed.csv
 graph3_indexed.csv
+__init__.py

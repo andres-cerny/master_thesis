@@ -110,7 +110,8 @@ class KalmanFilterWRLSEstimator:
                                 expected_interval_seconds: float,
                                 n_harmonics: int = 3,
                                 seasonal_period: float = 24.0,
-                                tolerance_percent: float = 10.0) -> Tuple[np.ndarray, pd.DataFrame, List[Tuple[np.ndarray, np.ndarray]]]:
+                                tolerance_percent: float = 10.0,
+                                verbose: bool = False) -> Tuple[np.ndarray, pd.DataFrame, List[Tuple[np.ndarray, np.ndarray]]]:
         """
         Construct state vectors and valid state pairs from water consumption data.
         
@@ -225,7 +226,7 @@ class KalmanFilterWRLSEstimator:
             validity_percentage = 0.0
         
         # Warn if validity is too low
-        if validity_percentage < 80.0:
+        if validity_percentage < 80.0 and verbose:
             warnings.warn(
                 f"Data quality warning: Only {validity_percentage:.1f}% of expected pairs are valid.\n"
                 f"  Expected pairs (based on time span): {expected_num_pairs}\n"
@@ -302,7 +303,8 @@ class KalmanFilterWRLSEstimator:
             expected_interval_seconds,
             n_harmonics,
             seasonal_period,
-            tolerance_percent
+            tolerance_percent,
+            verbose
         )
         
         state_dim = state_sequence.shape[1]

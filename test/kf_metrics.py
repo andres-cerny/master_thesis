@@ -256,7 +256,7 @@ class KalmanFilterMetrics:
             'innovation_kurtosis': stats.kurtosis(innovations),
             'innovation_normality_pvalue': p_value_normality,
             'innovation_autocorr_lag1': autocorr_lag1,
-            'innovation_is_white_noise': (np.abs(autocorr_lag1) < 0.1 and p_value_normality > 0.05)
+            'innovation_is_white_noise': bool(np.abs(autocorr_lag1) < 0.1 and p_value_normality > 0.05)
         }
     
     @staticmethod
