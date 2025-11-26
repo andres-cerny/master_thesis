@@ -6,8 +6,27 @@ from tqdm import tqdm
 import json
 from datetime import datetime
 
+def get_periodicity(df: pd.DataFrame, timestamp_col: str = 'timestamp_utc') -> int:
+    """
+    Returns:
+    --------
+    int
+        Most common periodicity in DataFrame
+    """
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], utc=True)
+        
+    time_diffs = df[timestamp_col].diff().dropna().dt.total_seconds()
+    
+    if time_diffs.empty:
+        raise ValueError("No time difference calculated.")
 
-def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_percentage=10):
+    common_periodicity_mode= time_diffs.mode()
+    #print(f"Periodicity found {common_periodicity_mode.iloc[0]/60} minutes.")
+    return common_periodicity_mode.iloc[0]
+    
+
+
+def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc', tolerance_percentage=10):
     """
     Fill gaps in time-series data for a single id sensor using adaptive timestamp generation.
     Instead of creating a full expected range upfront, this function builds the expected timeline
@@ -16,10 +35,8 @@ def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_perce
     Parameters:
     -----------
     df : pandas.DataFrame
-        DataFrame with columns: 'timestamp', 'hodnota', 'Diff' (and optionally 'id')
+        DataFrame with columns: 'timestamp_utc', 'hodnota', 'Diff' (and optionally 'id')
         Must contain data for a single sensor only.
-    periodicity_seconds : int
-        Expected time interval between consecutive readings in seconds (e.g., 1800 for 30 minutes)
     tolerance_percentage : float
         Tolerance as percentage of periodicity (e.g., 10 means 10% of periodicity_seconds)
         
@@ -30,14 +47,16 @@ def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_perce
     dict
         Dictionary with diagnostic information including detailed unmatched readings
     """
-    
     # Make a copy to avoid modifying original
     df = df.copy()
     
-    # Ensure timestamp is datetime
-    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    if len(df) < 2:
+        raise ValueError("DataFrame passed is too short len < 2")
     
-    if len(df) == 0:
+    try:
+        periodicity_seconds = get_periodicity(df)
+    except ValueError as e:
+        print(f"Couldn't find periodicity, skipping this df and getting an error: {e}")
         return df, {}
     
     # Calculate tolerance in seconds based on percentage
@@ -49,10 +68,10 @@ def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_perce
     matched_indices = set()
     
     # Start with the first timestamp
-    expected_next = df.loc[0, 'timestamp']
+    actual_reading_time = df.loc[0, timestamp_col]
     
     # Track the original data end time
-    data_end_time = df['timestamp'].max()
+    data_end_time = df[timestamp_col].max()
     
     def get_candidate_indeces(df, within_tolerance, matched_indices):
         if not within_tolerance.any():
@@ -63,23 +82,43 @@ def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_perce
         candidate_indices = [idx for idx in candidate_indices if idx not in matched_indices]
         return candidate_indices
     
-    while expected_next <= data_end_time:
+    while (actual_reading_time + pd.Timedelta(seconds=periodicity_seconds)) <= data_end_time:
+        # Calculate next expected timestamp from the ACTUAL reading
+        expected_next = actual_reading_time + pd.Timedelta(seconds=periodicity_seconds)
         # Find readings within tolerance of expected_next
-        time_diffs = abs((df['timestamp'] - expected_next).dt.total_seconds())
+        time_diffs = abs((df[timestamp_col] - expected_next).dt.total_seconds())
         within_tolerance = time_diffs <= tolerance_seconds
         candidate_indices = get_candidate_indeces(df, within_tolerance, matched_indices)
         
         if not candidate_indices:
-            # No reading within tolerance, add NaN row
+            time_diffs_real = (df[timestamp_col] - actual_reading_time).dt.total_seconds()
+            min_positive = time_diffs_real[time_diffs_real > 0].min()
+            next_real_index = time_diffs_real[time_diffs_real == min_positive].index[0]
+            
+            nans_needed = round(min_positive / periodicity_seconds)
+            
+            if nans_needed >= 2:
+                gap_period = min_positive / nans_needed
+                prev_reading_time = actual_reading_time
+
+                for _ in range(nans_needed - 1):
+                    expected_next = prev_reading_time + pd.Timedelta(seconds=gap_period)
+                    row_data = {
+                        'id': df.loc[0, 'id'],
+                        timestamp_col: expected_next,
+                        'hodnota': np.nan
+                    }
+                    result_rows.append(row_data)
+                    prev_reading_time = expected_next
+            
+            actual_reading_time = df.loc[next_real_index, timestamp_col]
             row_data = {
-                'id': df.loc[0, 'id'],
-                'timestamp': expected_next,
-                'hodnota': np.nan,
-                'Diff': np.nan
+                    'id': df.loc[next_real_index, 'id'],
+                    timestamp_col: actual_reading_time,
+                    'hodnota': df.loc[next_real_index, 'hodnota']
             }
-                        
             result_rows.append(row_data)
-            expected_next = expected_next + pd.Timedelta(seconds=periodicity_seconds)
+            matched_indices.add(next_real_index)
             continue
         
         # Find the closest one among candidates
@@ -88,16 +127,14 @@ def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_perce
         # Add this reading to results
         row_data = {
             'id': df.loc[closest_idx, 'id'],
-            'timestamp': expected_next,
-            'hodnota': df.loc[closest_idx, 'hodnota'],
-            'Diff': df.loc[closest_idx, 'Diff']
+            timestamp_col: df.loc[closest_idx, timestamp_col],
+            'hodnota': df.loc[closest_idx, 'hodnota']
         }                
         result_rows.append(row_data)
         matched_indices.add(closest_idx)
         
         # Calculate next expected timestamp from the ACTUAL reading
-        actual_reading_time = df.loc[closest_idx, 'timestamp']
-        expected_next = actual_reading_time + pd.Timedelta(seconds=periodicity_seconds)
+        actual_reading_time = df.loc[closest_idx, timestamp_col]
             
             
     # Create the filled DataFrame
@@ -105,9 +142,9 @@ def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_perce
     
     # Reorder columns to match original
     if 'id' in df.columns:
-        filled_df = filled_df[['id', 'timestamp', 'hodnota', 'Diff']]
+        filled_df = filled_df[['id', timestamp_col, 'hodnota']]
     else:
-        filled_df = filled_df[['timestamp', 'hodnota', 'Diff']]
+        filled_df = filled_df[[timestamp_col, 'hodnota']]
     
     # Identify unmatched readings
     unmatched_indices = [idx for idx in df.index if idx not in matched_indices]
@@ -118,9 +155,9 @@ def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_perce
         
         # Find what the expected slot would have been (closest in our result)
         if len(filled_df) > 0:
-            time_diffs_to_result = abs((filled_df['timestamp'] - row['timestamp']).dt.total_seconds())
+            time_diffs_to_result = abs((filled_df[timestamp_col] - row[timestamp_col]).dt.total_seconds())
             nearest_result_idx = time_diffs_to_result.argmin()
-            expected_slot = filled_df.loc[nearest_result_idx, 'timestamp']
+            expected_slot = filled_df.loc[nearest_result_idx, timestamp_col]
             time_diff = time_diffs_to_result.iloc[nearest_result_idx]
         else:
             expected_slot = None
@@ -134,37 +171,52 @@ def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_perce
         next_row = df.loc[next_idx] if next_idx is not None else None
         
         unmatched_detail.append({
-            'reading_timestamp': str(row['timestamp']),
+            'reading_timestamp': str(row[timestamp_col]),
             'hodnota': float(row['hodnota']) if pd.notna(row['hodnota']) else None,
-            'diff': float(row['Diff']) if pd.notna(row['Diff']) else None,
             'expected_slot': str(expected_slot) if expected_slot else None,
             'time_difference_seconds': float(time_diff) if time_diff is not None else None,
-            'prev_reading_timestamp': str(prev_row['timestamp']) if prev_row is not None else None,
+            'prev_reading_timestamp': str(prev_row[timestamp_col]) if prev_row is not None else None,
             'prev_reading_value': float(prev_row['hodnota']) if prev_row is not None and pd.notna(prev_row['hodnota']) else None,
-            'next_reading_timestamp': str(next_row['timestamp']) if next_row is not None else None,
+            'next_reading_timestamp': str(next_row[timestamp_col]) if next_row is not None else None,
             'next_reading_value': float(next_row['hodnota']) if next_row is not None and pd.notna(next_row['hodnota']) else None
         })
+        
+    filled_diffs = filled_df[timestamp_col].diff()
+    min_allowed_diff = pd.Timedelta(seconds=periodicity_seconds*0.5)
+    max_allowed_diff = pd.Timedelta(seconds=periodicity_seconds*1.5)
+    if ((min_allowed_diff > filled_diffs) | (filled_diffs > max_allowed_diff)).any():
+        raise ValueError("Some timestamp differences in the new resampled df are larger or smaller then allowed.")
+        #for idx, diff in enumerate(filled_diffs):
+        #    if min_allowed_diff > diff:
+        #        print(f"Diff is smaller then possible on idx: {idx} which is datetime {filled_df[timestamp_col].loc[idx]}")
+        #    elif diff > max_allowed_diff:
+        #        print(f"Diff is larger then possible on idx: {idx} which is datetime {filled_df[timestamp_col].loc[idx]}")
+    
+     # Add Diff (diff needs to be recalculated so when there is a gap there is no diff after a gap)
+    filled_df['Diff'] = filled_df['hodnota'].diff()
+    # This is for metadata_001 (we allow 0.001 negative difference and set it to 0)
+    # Set Diff to np.nan where it is smaller than -0.001
+    filled_df.loc[filled_df['Diff'] <= -0.002, 'Diff'] = np.nan
+    filled_df.loc[(filled_df['Diff'] > -0.002) & (filled_df['Diff'] < 0), 'Diff'] = 0
     
     # Calculate diagnostics
     total_filled = len(filled_df)
     missing_count = filled_df['hodnota'].isna().sum()
-    expected_per_day = (24 * 60 * 60) / periodicity_seconds
+    diff_nan_count = filled_df['Diff'].isna().sum()
     
-    filled_df['date'] = filled_df['timestamp'].dt.date
-    samples_per_day = filled_df.groupby('date').size()
-    filled_df = filled_df.drop(columns=['date'])
+    timespan = (df.iloc[-1][timestamp_col] - df.iloc[0][timestamp_col]).total_seconds()
+    expected_timestamps = timespan / periodicity_seconds
     
     diagnostics = {
-        'total_expected_timestamps': total_filled,
+        'total_expected_timestamps': expected_timestamps,
         'total_actual_readings': len(df),
         'total_after_filling': total_filled,
         'total_matched_readings': len(matched_indices),
         'missing_values_filled': missing_count,
+        'nan_diff_count': diff_nan_count,
         'unmatched_readings_count': len(unmatched_indices),
         'unmatched_readings_detail': unmatched_detail,
-        'expected_samples_per_day': expected_per_day,
-        'actual_samples_per_day': {str(k): int(v) for k, v in samples_per_day.to_dict().items()},
-        'date_range': f"{df['timestamp'].min().date()} to {df['timestamp'].max().date()}",
+        'date_range': f"{df[timestamp_col].min().date()} to {df[timestamp_col].max().date()}",
         'periodicity_used_seconds': periodicity_seconds,
         'tolerance_percentage': tolerance_percentage,
         'tolerance_used_seconds': tolerance_seconds
@@ -173,16 +225,20 @@ def fill_gaps_with_periodicity_adaptive(df, periodicity_seconds, tolerance_perce
     return filled_df, diagnostics
 
 
-def process_file_with_gap_filling(file_metadata_pair, output_folder, tolerance_percentage=10):
+def process_file_with_gap_filling(input_file: str, output_folder: str, output_folder_metadata: str, timestamp_col: str = 'timestamp_utc', tolerance_percentage=10):
     """
     Process a single CSV file: fill gaps with adaptive periodicity.
     
     Parameters:
     -----------
-    file_metadata_pair : tuple
-        Tuple of (filepath, metadata_filepath)
+    input_file : str
+        Filepath to file to be resampled
     output_folder : str
         Folder where the processed file will be saved
+    output_folder_metadata : str
+        Folder where diagnostics of the precessing will be saved
+    timestamp_col: str
+        Column name with timestamps
     tolerance_percentage : float
         Tolerance as percentage of periodicity
         
@@ -191,28 +247,35 @@ def process_file_with_gap_filling(file_metadata_pair, output_folder, tolerance_p
     dict
         Summary statistics for this file
     """
-    filepath, metadata_filepath = file_metadata_pair
+    filepath = input_file
     
     try:
         # Read the CSV file
         df = pd.read_csv(filepath)
         
         # Ensure timestamp column exists
-        if 'timestamp' not in df.columns:
-            raise ValueError(f"File {filepath} missing 'timestamp' column")
+        if timestamp_col not in df.columns:
+            raise ValueError(f"File {filepath} missing {timestamp_col} column")
         
-        # Get periodicity from metadata
-        with open(metadata_filepath, 'r') as file:
-            metadata = json.load(file)
-            
-        periodicity_seconds = metadata["common_periodicity_seconds"]
+        df[timestamp_col] = pd.to_datetime(df[timestamp_col], utc=True)
+        time_now = pd.Timestamp.now(tz='UTC')
+        one_year_ago = time_now - pd.DateOffset(years=1)
+
+        mask = df[timestamp_col] > one_year_ago
+        df = df.loc[mask].reset_index(drop=True)
+        
+        if df.empty:
+            raise ValueError(f"File {filepath} doesn't have any data in past year")
         
         # Fill gaps
+        #try:
         filled_df, diagnostics = fill_gaps_with_periodicity_adaptive(
             df, 
-            periodicity_seconds=periodicity_seconds, 
+            timestamp_col=timestamp_col, 
             tolerance_percentage=tolerance_percentage
         )
+        #except Exception as e:
+        #    print(f"Failed {input_file} with {e}.")
         
         # Create output filepath
         filename = os.path.basename(filepath)
@@ -221,12 +284,31 @@ def process_file_with_gap_filling(file_metadata_pair, output_folder, tolerance_p
         # Save the filled dataframe
         filled_df.to_csv(output_filepath, index=False)
         
+        # Create output filepath metadata
+        filename = os.path.basename(filepath)
+        json_path = os.path.join(output_folder_metadata, filename.replace('.csv', '.json'))
+        
+        def convert_np_types(obj):
+            if isinstance(obj, dict):
+                return {k: convert_np_types(v) for k, v in obj.items()}
+            elif isinstance(obj, list):
+                return [convert_np_types(elem) for elem in obj]
+            elif isinstance(obj, (np.integer, np.int64)):
+                return int(obj)
+            elif isinstance(obj, (np.floating, np.float64)):
+                return float(obj)
+            else:
+                return obj
+
+        metadata_clean = convert_np_types(diagnostics)  # Convert all np types to native Python types
+        with open(json_path, 'w') as f:
+            json.dump(metadata_clean, f, indent=4)
+        
         # Return summary
         return {
             'filename': filename,
             'success': True,
-            'periodicity_seconds': periodicity_seconds,
-            'periodicity_minutes': round(periodicity_seconds / 60, 2),
+            'periodicity_seconds': diagnostics['periodicity_used_seconds'],
             'original_rows': diagnostics['total_actual_readings'],
             'filled_rows': diagnostics['total_after_filling'],
             'missing_filled': diagnostics['missing_values_filled'],
@@ -243,10 +325,11 @@ def process_file_with_gap_filling(file_metadata_pair, output_folder, tolerance_p
 
 
 def fill_gaps_multithreaded(input_folder="./data_w_diff_001",
-                           metadata_folder="./metadata_001",
+                           metadata_folder="./metadata_resample",
                            output_folder="./data_w_diff_001_resampled",
                            tolerance_percentage=10,
-                           max_workers=8):
+                           max_workers=8,
+                           timestamp_col: str = 'timestamp_utc'):
     """
     Process all CSV files in input folder using multithreading to fill gaps.
     
@@ -255,52 +338,33 @@ def fill_gaps_multithreaded(input_folder="./data_w_diff_001",
     input_folder : str
         Folder containing input CSV files
     metadata_folder : str
-        Folder containing metadata for input data
+        Folder containing metadata for diagnostics data
     output_folder : str
         Folder where processed files will be saved
     tolerance_percentage : float
         Tolerance as percentage of periodicity (default 10%)
     max_workers : int
         Number of threads to use
+    timestamp_col : str
+        Name of the DataFrame column where timestamps are located
     """
     
     # Create output folder if it doesn't exist
     os.makedirs(output_folder, exist_ok=True)
     
     # Get all CSV files and metadata files
-    csv_files = sorted([f for f in os.listdir(input_folder) if f.endswith('.csv')])
-    metadata_files = sorted([f for f in os.listdir(metadata_folder) if f.endswith('.json')])
+    csv_files = sorted([os.path.join(input_folder, f) for f in os.listdir(input_folder) if f.endswith('.csv')])
     
     if len(csv_files) == 0:
         print(f"No CSV files found in {input_folder}")
         return []
-    
-    if len(csv_files) != len(metadata_files):
-        print(f"Warning: Number of metadata files ({len(metadata_files)}) does not equal number of CSV files ({len(csv_files)}).")
-        print(f"Will only process files that have matching metadata.")
-    
-    # Create pairs of (csv_filepath, metadata_filepath) by matching filenames
-    file_pairs = []
-    for csv_file in csv_files:
-        # Assume metadata has same name but .json extension
-        base_name = os.path.splitext(csv_file)[0]
-        metadata_file = base_name + '.json'
         
-        if metadata_file in metadata_files:
-            csv_path = os.path.join(input_folder, csv_file)
-            metadata_path = os.path.join(metadata_folder, metadata_file)
-            file_pairs.append((csv_path, metadata_path))
-        else:
-            print(f"Warning: No metadata found for {csv_file}, skipping.")
-    
-    if len(file_pairs) == 0:
-        print("No matching file-metadata pairs found!")
-        return []
-    
-    print(f"Processing {len(file_pairs)} files with:")
+    print(f"Processing {len(csv_files)} files with:")
     print(f"  - Tolerance: {tolerance_percentage}%")
     print(f"  - Threads: {max_workers}")
+    print(f"  - Input folder: {input_folder}")
     print(f"  - Output folder: {output_folder}")
+    print(f"  - Metadata folder: {metadata_folder}")
     
     # Process files in parallel
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -309,13 +373,15 @@ def fill_gaps_multithreaded(input_folder="./data_w_diff_001",
         process_func = partial(
             process_file_with_gap_filling,
             output_folder=output_folder,
+            output_folder_metadata=metadata_folder,
+            timestamp_col=timestamp_col,
             tolerance_percentage=tolerance_percentage
         )
         
         # Execute with progress bar
         results = list(tqdm(
-            executor.map(process_func, file_pairs),
-            total=len(file_pairs),
+            executor.map(process_func, csv_files),
+            total=len(csv_files),
             desc="Filling gaps",
             unit="file"
         ))
@@ -355,10 +421,11 @@ def main():
     """
     # Configure your parameters here
     INPUT_FOLDER = "./data_w_diff_001"
-    METADATA_FOLDER = "./metadata_001"
-    OUTPUT_FOLDER = "./data_w_diff_resampled"
+    METADATA_FOLDER = "./metadata_resample"
+    OUTPUT_FOLDER = "./data_w_diff_001_resampled"
     TOLERANCE_PERCENTAGE = 10  # 10% of periodicity
     MAX_WORKERS = 8
+    TIMESTAMP_COL = 'timestamp_utc'
     
     # Run the multithreaded gap filling
     results = fill_gaps_multithreaded(
@@ -366,7 +433,8 @@ def main():
         metadata_folder=METADATA_FOLDER,
         output_folder=OUTPUT_FOLDER,
         tolerance_percentage=TOLERANCE_PERCENTAGE,
-        max_workers=MAX_WORKERS
+        max_workers=MAX_WORKERS,
+        timestamp_col=TIMESTAMP_COL
     )
     
     if not results:
@@ -418,10 +486,14 @@ def main():
     print(f"\nResults saved to: {results_filepath}")
 
 def test():
-    df = pd.read_csv('data_w_diff_001/2328.csv')
-    filled_df, diagnostics = fill_gaps_with_periodicity_adaptive(df, 30*60)
+    #df = pd.read_csv()
+    try:
+        filled_df, diagnostics = process_file_with_gap_filling('data_w_diff_001/151504.csv', 'data_w_diff_001_resampled', 'metadata_resample')
+    except Exception as e:
+        print(f"Fuck {e}")
     print(diagnostics)
+    return filled_df, diagnostics
     
 
 if __name__ == "__main__":
-    test()
+    main()
