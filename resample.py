@@ -54,7 +54,7 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
         raise ValueError("DataFrame passed is too short len < 2")
     
     try:
-        periodicity_seconds = get_periodicity(df)
+        periodicity_seconds = get_periodicity(df, timestamp_col=timestamp_col)
     except ValueError as e:
         print(f"Couldn't find periodicity, skipping this df and getting an error: {e}")
         return df, {}
@@ -93,7 +93,13 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
         if not candidate_indices:
             time_diffs_real = (df[timestamp_col] - actual_reading_time).dt.total_seconds()
             min_positive = time_diffs_real[time_diffs_real > 0].min()
-            next_real_index = time_diffs_real[time_diffs_real == min_positive].index[0]
+            try:
+                next_real_index = time_diffs_real[time_diffs_real == min_positive].index[0]
+            except Exception as e:
+                print(f"Failed at {actual_reading_time} with period of {periodicity_seconds}, end it as {data_end_time}")
+                print(f"Min positive was {min_positive}")
+                print(f"With error {e}")
+                return df, {}
             
             nans_needed = round(min_positive / periodicity_seconds)
             
