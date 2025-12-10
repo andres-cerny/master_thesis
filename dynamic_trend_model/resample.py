@@ -35,7 +35,7 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
     Parameters:
     -----------
     df : pandas.DataFrame
-        DataFrame with columns: 'timestamp_utc', 'hodnota', 'Diff' (and optionally 'id')
+        DataFrame with columns: 'timestamp_utc', 'hodnota', 'Diff'
         Must contain data for a single sensor only.
     tolerance_percentage : float
         Tolerance as percentage of periodicity (e.g., 10 means 10% of periodicity_seconds)
@@ -52,6 +52,16 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
     
     if len(df) < 2:
         raise ValueError("DataFrame passed is too short len < 2")
+    
+    if timestamp_col not in df.columns:
+            raise ValueError(
+                f"No {timestamp_col} column found. Available: {df.columns.tolist()}"
+            )
+            
+    if 'hodnota' not in df.columns:
+            raise ValueError(
+                f"No 'hodnota' column found. Available: {df.columns.tolist()}"
+            )
     
     try:
         periodicity_seconds = get_periodicity(df, timestamp_col=timestamp_col)
@@ -92,16 +102,24 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
         
         if not candidate_indices:
             time_diffs_real = (df[timestamp_col] - actual_reading_time).dt.total_seconds()
-            min_positive = time_diffs_real[time_diffs_real > 0].min()
-            try:
-                next_real_index = time_diffs_real[time_diffs_real == min_positive].index[0]
-            except Exception as e:
-                print(f"Failed at {actual_reading_time} with period of {periodicity_seconds}, end it as {data_end_time}")
-                print(f"Min positive was {min_positive}")
-                print(f"With error {e}")
-                return df, {}
+            sorted_diffs = time_diffs_real[time_diffs_real > 0].sort_values()
+            min_positive = sorted_diffs.iloc[0]
             
-            nans_needed = round(min_positive / periodicity_seconds)
+            min_allowed_diff = periodicity_seconds*0.5
+            idx_sorted_diffs = 0
+            not_enough_data = False
+            while min_positive < min_allowed_diff:
+                idx_sorted_diffs += 1
+                if len(sorted_diffs) <= idx_sorted_diffs:
+                    not_enough_data = True
+                    break
+                min_positive = sorted_diffs.iloc[idx_sorted_diffs]
+            
+            next_real_index = time_diffs_real[time_diffs_real == min_positive].index[0]
+            nans_needed = round(sorted_diffs.iloc[0] / periodicity_seconds)
+            
+            if not_enough_data:
+                break
             
             if nans_needed >= 2:
                 gap_period = min_positive / nans_needed
@@ -110,7 +128,6 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
                 for _ in range(nans_needed - 1):
                     expected_next = prev_reading_time + pd.Timedelta(seconds=gap_period)
                     row_data = {
-                        'id': df.loc[0, 'id'],
                         timestamp_col: expected_next,
                         'hodnota': np.nan
                     }
@@ -119,7 +136,6 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
             
             actual_reading_time = df.loc[next_real_index, timestamp_col]
             row_data = {
-                    'id': df.loc[next_real_index, 'id'],
                     timestamp_col: actual_reading_time,
                     'hodnota': df.loc[next_real_index, 'hodnota']
             }
@@ -132,7 +148,6 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
         
         # Add this reading to results
         row_data = {
-            'id': df.loc[closest_idx, 'id'],
             timestamp_col: df.loc[closest_idx, timestamp_col],
             'hodnota': df.loc[closest_idx, 'hodnota']
         }                
@@ -146,11 +161,8 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
     # Create the filled DataFrame
     filled_df = pd.DataFrame(result_rows)
     
-    # Reorder columns to match original
-    if 'id' in df.columns:
-        filled_df = filled_df[['id', timestamp_col, 'hodnota']]
-    else:
-        filled_df = filled_df[[timestamp_col, 'hodnota']]
+
+    filled_df = filled_df[[timestamp_col, 'hodnota']]
     
     # Identify unmatched readings
     unmatched_indices = [idx for idx in df.index if idx not in matched_indices]
