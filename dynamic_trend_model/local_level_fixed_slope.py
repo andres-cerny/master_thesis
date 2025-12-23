@@ -4,7 +4,7 @@ Local Trend (Local Level with Fixed Slope) Batch Processor for Water Meter Anoma
 
 Processes multiple water meter CSV files with:
 - Multithreaded execution
-- Configurable periodicity (window_size via metadata)
+- Configurable periodicity
 - Resampling & gap filling using fill_gaps_with_periodicity_adaptive
 - Initial training on 3–2 months ago data
 - Second training on 2–1 months ago data, initialized from previous month state
@@ -137,38 +137,73 @@ class LocalLevelWithFixedSlope(sm.tsa.statespace.MLEModel):
 
 def calculate_metrics(actuals, predictions, residuals):
     """
-    Calculate comprehensive metrics for predictions
+    Calculate comprehensive metrics for predictions, including both all-data 
+    and non-zero-only metrics
+
+    Parameters:
+    -----------
+    actuals : array-like
+        Actual values
+    predictions : array-like
+        Predicted values
+    residuals : array-like
+        Residuals (actuals - predictions)
+
+    Returns:
+    --------
+    dict : Dictionary containing all metrics with suffixes for non-zero variants
     """
     metrics = {}
 
+    # Create mask for non-zero actuals
+    non_zero_mask = actuals != 0
+    non_zero_count = np.sum(non_zero_mask)
+
+    # Store the count of zero and non-zero values for reference
+    metrics["total_count"] = len(actuals)
+    metrics["non_zero_count"] = non_zero_count
+    metrics["zero_count"] = len(actuals) - non_zero_count
+    metrics["non_zero_percentage"] = (non_zero_count / len(actuals)) * 100 if len(actuals) > 0 else 0
+
+    # ====================
+    # ALL DATA METRICS
+    # ====================
+
+    # Basic metrics
     metrics["rmse"] = np.sqrt(mean_squared_error(actuals, predictions))
     metrics["mae"] = mean_absolute_error(actuals, predictions)
     metrics["r2"] = r2_score(actuals, predictions)
 
+    # MAPE (handle division by zero)
     try:
         metrics["mape"] = mean_absolute_percentage_error(actuals, predictions)
     except Exception:
         metrics["mape"] = np.nan
 
+    # Additional metrics
     metrics["mean_residual"] = np.mean(residuals)
     metrics["std_residual"] = np.std(residuals)
     metrics["max_residual"] = np.max(residuals)
     metrics["min_residual"] = np.min(residuals)
 
+    # RMSE normalized by actual variance
     actual_var = np.var(actuals)
     if actual_var > 0:
         metrics["normalized_rmse"] = metrics["rmse"] / np.sqrt(actual_var)
     else:
         metrics["normalized_rmse"] = np.nan
 
+    # Median Absolute Percentage Error (robust to outliers)
     try:
         mape_values = np.abs((actuals - predictions) / (np.abs(actuals) + 1e-8))
         metrics["median_ape"] = np.median(mape_values)
     except Exception:
         metrics["median_ape"] = np.nan
 
+    # Prediction bias
     metrics["prediction_bias"] = np.mean(predictions - actuals)
 
+    # Direction accuracy (percentage of correct sign predictions)
     actual_diff = np.diff(actuals)
     pred_diff = np.diff(predictions)
     if len(actual_diff) > 0:
@@ -176,6 +211,82 @@ def calculate_metrics(actuals, predictions, residuals):
         metrics["direction_accuracy"] = direction_matches / len(actual_diff)
     else:
         metrics["direction_accuracy"] = np.nan
+
+    # ====================
+    # NON-ZERO ONLY METRICS
+    # ====================
+
+    if non_zero_count > 0:
+        # Filter data to non-zero actuals only
+        actuals_nz = actuals[non_zero_mask]
+        predictions_nz = predictions[non_zero_mask]
+        residuals_nz = residuals[non_zero_mask]
+
+        # Basic metrics for non-zero values
+        metrics["rmse_nz"] = np.sqrt(mean_squared_error(actuals_nz, predictions_nz))
+        metrics["mae_nz"] = mean_absolute_error(actuals_nz, predictions_nz)
+
+        # R2 for non-zero values
+        try:
+            metrics["r2_nz"] = r2_score(actuals_nz, predictions_nz)
+        except Exception:
+            metrics["r2_nz"] = np.nan
+
+        # MAPE for non-zero values (should work since we excluded zeros)
+        try:
+            metrics["mape_nz"] = mean_absolute_percentage_error(actuals_nz, predictions_nz)
+        except Exception:
+            metrics["mape_nz"] = np.nan
+
+        # Residual statistics for non-zero values
+        metrics["mean_residual_nz"] = np.mean(residuals_nz)
+        metrics["std_residual_nz"] = np.std(residuals_nz)
+        metrics["max_residual_nz"] = np.max(residuals_nz)
+        metrics["min_residual_nz"] = np.min(residuals_nz)
+
+        # RMSE normalized by actual variance (non-zero)
+        actual_var_nz = np.var(actuals_nz)
+        if actual_var_nz > 0:
+            metrics["normalized_rmse_nz"] = metrics["rmse_nz"] / np.sqrt(actual_var_nz)
+        else:
+            metrics["normalized_rmse_nz"] = np.nan
+
+        # Median Absolute Percentage Error for non-zero values
+        try:
+            mape_values_nz = np.abs((actuals_nz - predictions_nz) / np.abs(actuals_nz))
+            metrics["median_ape_nz"] = np.median(mape_values_nz)
+        except Exception:
+            metrics["median_ape_nz"] = np.nan
+
+        # Prediction bias for non-zero values
+        metrics["prediction_bias_nz"] = np.mean(predictions_nz - actuals_nz)
+
+        # Direction accuracy for non-zero values
+        if len(actuals_nz) > 1:
+            actual_diff_nz = np.diff(actuals_nz)
+            pred_diff_nz = np.diff(predictions_nz)
+            if len(actual_diff_nz) > 0:
+                direction_matches_nz = np.sum((actual_diff_nz > 0) == (pred_diff_nz > 0))
+                metrics["direction_accuracy_nz"] = direction_matches_nz / len(actual_diff_nz)
+            else:
+                metrics["direction_accuracy_nz"] = np.nan
+        else:
+            metrics["direction_accuracy_nz"] = np.nan
+
+    else:
+        # If no non-zero values exist, set all non-zero metrics to NaN
+        metrics["rmse_nz"] = np.nan
+        metrics["mae_nz"] = np.nan
+        metrics["r2_nz"] = np.nan
+        metrics["mape_nz"] = np.nan
+        metrics["mean_residual_nz"] = np.nan
+        metrics["std_residual_nz"] = np.nan
+        metrics["max_residual_nz"] = np.nan
+        metrics["min_residual_nz"] = np.nan
+        metrics["normalized_rmse_nz"] = np.nan
+        metrics["median_ape_nz"] = np.nan
+        metrics["prediction_bias_nz"] = np.nan
+        metrics["direction_accuracy_nz"] = np.nan
 
     return metrics
 
@@ -225,8 +336,6 @@ def build_results_df(timestamps, actuals, predictions):
 
 def process_single_meter(
     csv_filepath: str,
-    window_size: int,
-    metadata: dict,
     device: Optional[torch.device] = None,
     verbose: bool = False,
 ) -> Dict:
@@ -244,7 +353,6 @@ def process_single_meter(
     result = {
         "filename": Path(csv_filepath).stem,
         "filepath": csv_filepath,
-        "window_size": window_size,
         "status": "processing",
         "error": None,
     }
@@ -310,6 +418,30 @@ def process_single_meter(
         result["train_samples_filled"] = len(df_train)
         result["second_train_samples_filled"] = len(df_second)
         result["predict_samples_filled"] = len(df_predict)
+        
+        result["periodicity_seconds_train"] = periodicity_seconds_train
+        result["periodicity_seconds_second"] = periodicity_seconds_second
+        result["periodicity_seconds_predict"] = periodicity_seconds_predict
+        
+        periods = [
+            periodicity_seconds_train,
+            periodicity_seconds_second,
+            periodicity_seconds_predict,
+        ]
+
+        p_min = min(periods)
+
+        # avoid division by zero if needed
+        if p_min == 0:
+            all_within_10pct = all(p == 0 for p in periods)
+        else:
+            all_within_10pct = all(abs(p - p_min) / p_min <= 0.10 for p in periods)
+
+        if not all_within_10pct:
+            raise ValueError(f"All tree periodicities are not within 10% range.\
+                Periodicity Train: {periodicity_seconds_train}, \
+                Periodicity Second: {periodicity_seconds_train}, \
+                Periodicity Predict: {periodicity_seconds_predict}.")
 
         if verbose:
             logger.info(
@@ -394,11 +526,9 @@ def process_single_meter(
         predictions_df = build_results_df(
             timestamps_used, actuals_used, predictions_used
         )
-        print("getting metrics")
         # ===== METRICS =====
         residuals = predictions_df["residual"].values
         metrics = calculate_metrics(actuals_used, predictions_used, residuals)
-        print("calculated metrics")
         for key, value in metrics.items():
             result[f"metric_{key}"] = value
 
@@ -428,7 +558,6 @@ def process_single_meter(
 
 def process_batch(
     csv_filepaths: List[str],
-    metadata_dir: str,
     output_csv: str,
     num_workers: int = 4,
     verbose: bool = False,
@@ -449,32 +578,9 @@ def process_batch(
         for filepath in csv_filepaths:
             filename = Path(filepath).stem
 
-            try:
-                metadata_filepath = os.path.join(
-                    metadata_dir, filename.split(".")[0] + ".json"
-                )
-                with open(metadata_filepath, "r") as f:
-                    metadata = json.load(f)
-
-                window_size = int(
-                    round(24 * 60 * 60 / metadata["common_periodicity_seconds"])
-                )
-            except Exception as e:
-                logger.error(f"Failed to prepare metadata for {filename}: {e}")
-                all_results.append(
-                    {
-                        "filename": filename,
-                        "status": "failed",
-                        "error": str(e),
-                    }
-                )
-                continue
-
             future = executor.submit(
                 process_single_meter,
                 filepath,
-                window_size,
-                metadata,
                 device=device,
                 verbose=verbose,
             )
@@ -569,16 +675,14 @@ def main():
         if os.path.isfile(os.path.join(directory, f))
     ]
     random.seed(seed_value)
-    csv_filepaths = random.sample(all_files, min(10, len(all_files)))
+    csv_filepaths = random.sample(all_files, min(1000, len(all_files)))
     #csv_filepaths = ['../data_w_diff_001/103458.csv']
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    metadata_dir = "../metadata_001"
-    output_csv = "./results_local_trend_test.csv"
+    output_csv = "./results_local_trend_1000_seed_42.csv"
 
     _ = process_batch(
         csv_filepaths,
-        metadata_dir,
         output_csv,
         num_workers=args.workers,
         verbose=args.verbose,
