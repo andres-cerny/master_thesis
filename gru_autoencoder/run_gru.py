@@ -39,6 +39,8 @@ import random
 import time
 from tqdm import tqdm
 
+from pandas.tseries.offsets import DateOffset
+
 warnings.filterwarnings("ignore")
 
 # ============================================================================
@@ -115,7 +117,7 @@ class GRUNet(nn.Module):
     def forward(self, x):
         """
         Args:
-            x: Input tensor (batch_size, seq_len, 6)
+            x: Input tensor (batch_size, seq_len, 6) 
 
         Returns:
             output: Predictions (batch_size, seq_len, 1)
@@ -135,7 +137,7 @@ class MeterDataset(Dataset):
     PyTorch Dataset for water meter time series with harmonic features
     """
 
-    def __init__(self, df, window_size=48, train=True, scaler=None):
+    def __init__(self, df, window_size, train=True, scaler=None):
         """
         Args:
             df: DataFrame with columns ['timestamp_utc', 'Diff']
@@ -223,9 +225,9 @@ class MeterDataset(Dataset):
 
 def train_gru_model(
     df,
-    window_size=48,
+    window_size,
     model_path=None,
-    epochs=50,
+    epochs=5,
     batch_size=32,
     hidden_size=32,
     learning_rate=1e-3,
@@ -450,12 +452,39 @@ def predict_with_gru(model, df, scaler, window_size, device=None):
 # METRICS CALCULATION
 # ============================================================================
 
-
 def calculate_metrics(actuals, predictions, residuals):
     """
-    Calculate comprehensive metrics for predictions
+    Calculate comprehensive metrics for predictions, including both all-data 
+    and non-zero-only metrics
+
+    Parameters:
+    -----------
+    actuals : array-like
+        Actual values
+    predictions : array-like
+        Predicted values
+    residuals : array-like
+        Residuals (actuals - predictions)
+
+    Returns:
+    --------
+    dict : Dictionary containing all metrics with suffixes for non-zero variants
     """
     metrics = {}
+
+    # Create mask for non-zero actuals
+    non_zero_mask = actuals != 0
+    non_zero_count = np.sum(non_zero_mask)
+
+    # Store the count of zero and non-zero values for reference
+    metrics["total_count"] = len(actuals)
+    metrics["non_zero_count"] = non_zero_count
+    metrics["zero_count"] = len(actuals) - non_zero_count
+    metrics["non_zero_percentage"] = (non_zero_count / len(actuals)) * 100 if len(actuals) > 0 else 0
+
+    # ====================
+    # ALL DATA METRICS
+    # ====================
 
     # Basic metrics
     metrics["rmse"] = np.sqrt(mean_squared_error(actuals, predictions))
@@ -500,6 +529,82 @@ def calculate_metrics(actuals, predictions, residuals):
     else:
         metrics["direction_accuracy"] = np.nan
 
+    # ====================
+    # NON-ZERO ONLY METRICS
+    # ====================
+
+    if non_zero_count > 0:
+        # Filter data to non-zero actuals only
+        actuals_nz = actuals[non_zero_mask]
+        predictions_nz = predictions[non_zero_mask]
+        residuals_nz = residuals[non_zero_mask]
+
+        # Basic metrics for non-zero values
+        metrics["rmse_nz"] = np.sqrt(mean_squared_error(actuals_nz, predictions_nz))
+        metrics["mae_nz"] = mean_absolute_error(actuals_nz, predictions_nz)
+
+        # R2 for non-zero values
+        try:
+            metrics["r2_nz"] = r2_score(actuals_nz, predictions_nz)
+        except Exception:
+            metrics["r2_nz"] = np.nan
+
+        # MAPE for non-zero values (should work since we excluded zeros)
+        try:
+            metrics["mape_nz"] = mean_absolute_percentage_error(actuals_nz, predictions_nz)
+        except Exception:
+            metrics["mape_nz"] = np.nan
+
+        # Residual statistics for non-zero values
+        metrics["mean_residual_nz"] = np.mean(residuals_nz)
+        metrics["std_residual_nz"] = np.std(residuals_nz)
+        metrics["max_residual_nz"] = np.max(residuals_nz)
+        metrics["min_residual_nz"] = np.min(residuals_nz)
+
+        # RMSE normalized by actual variance (non-zero)
+        actual_var_nz = np.var(actuals_nz)
+        if actual_var_nz > 0:
+            metrics["normalized_rmse_nz"] = metrics["rmse_nz"] / np.sqrt(actual_var_nz)
+        else:
+            metrics["normalized_rmse_nz"] = np.nan
+
+        # Median Absolute Percentage Error for non-zero values
+        try:
+            mape_values_nz = np.abs((actuals_nz - predictions_nz) / np.abs(actuals_nz))
+            metrics["median_ape_nz"] = np.median(mape_values_nz)
+        except Exception:
+            metrics["median_ape_nz"] = np.nan
+
+        # Prediction bias for non-zero values
+        metrics["prediction_bias_nz"] = np.mean(predictions_nz - actuals_nz)
+
+        # Direction accuracy for non-zero values
+        if len(actuals_nz) > 1:
+            actual_diff_nz = np.diff(actuals_nz)
+            pred_diff_nz = np.diff(predictions_nz)
+            if len(actual_diff_nz) > 0:
+                direction_matches_nz = np.sum((actual_diff_nz > 0) == (pred_diff_nz > 0))
+                metrics["direction_accuracy_nz"] = direction_matches_nz / len(actual_diff_nz)
+            else:
+                metrics["direction_accuracy_nz"] = np.nan
+        else:
+            metrics["direction_accuracy_nz"] = np.nan
+
+    else:
+        # If no non-zero values exist, set all non-zero metrics to NaN
+        metrics["rmse_nz"] = np.nan
+        metrics["mae_nz"] = np.nan
+        metrics["r2_nz"] = np.nan
+        metrics["mape_nz"] = np.nan
+        metrics["mean_residual_nz"] = np.nan
+        metrics["std_residual_nz"] = np.nan
+        metrics["max_residual_nz"] = np.nan
+        metrics["min_residual_nz"] = np.nan
+        metrics["normalized_rmse_nz"] = np.nan
+        metrics["median_ape_nz"] = np.nan
+        metrics["prediction_bias_nz"] = np.nan
+        metrics["direction_accuracy_nz"] = np.nan
+
     return metrics
 
 
@@ -507,10 +612,26 @@ def calculate_metrics(actuals, predictions, residuals):
 # MAIN PROCESSING FUNCTION
 # ============================================================================
 
+def get_periodicity(df: pd.DataFrame, timestamp_col: str = 'timestamp_utc') -> int:
+    """
+    Returns:
+    --------
+    int
+        Most common periodicity in DataFrame
+    """
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], utc=True)
+        
+    time_diffs = df[timestamp_col].diff().dropna().dt.total_seconds()
+    
+    if time_diffs.empty:
+        raise ValueError("No time difference calculated.")
+
+    common_periodicity_mode= time_diffs.mode()
+    #print(f"Periodicity found {common_periodicity_mode.iloc[0]/60} minutes.")
+    return common_periodicity_mode.iloc[0]
 
 def process_single_meter(
     csv_filepath: str,
-    window_size: int,
     temp_dir: str = "./temp_models",
     device: Optional[torch.device] = None,
     epochs_train: int = 20,
@@ -526,7 +647,6 @@ def process_single_meter(
     result = {
         "filename": Path(csv_filepath).stem,
         "filepath": csv_filepath,
-        "window_size": window_size,
         "status": "processing",
         "error": None,
     }
@@ -545,54 +665,59 @@ def process_single_meter(
 
         if "Diff" not in df.columns:
             raise ValueError(f"No 'Diff' column found. Available: {df.columns.tolist()}")
-        
-        if window_size < 1:
-            raise ValueError(f"Periodicity smaller then one measurement per day. Cannot use daily harmonics.")
 
         df = df[["timestamp_utc", "Diff"]].copy()
         df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
         df = df.dropna()
 
-        # ===== SPLIT DATA INTO PERIODS =====
-        readings_per_day = window_size
-        days_3_to_2_months = 30
-        days_2_to_1_months = 30
-        days_last_month = 30
-
-        readings_3_to_2m = readings_per_day * days_3_to_2_months
-        readings_2_to_1m = readings_per_day * days_2_to_1_months
-        readings_last_m = readings_per_day * days_last_month
-
-        total_readings_needed = readings_3_to_2m + readings_2_to_1m + readings_last_m
-
-        if len(df) < total_readings_needed:
-            raise ValueError(f"Insufficient data: only {len(df)} readings provided but needed {total_readings_needed}.")
-
-        idx_start = max(
-            0, len(df) - readings_3_to_2m - readings_2_to_1m - readings_last_m
-        )
+        # ===== SPLIT INTO 3 CHUNKS (3–2m, 2–1m, 1m) =====
+        df['timestamp_utc'] = pd.to_datetime(df['timestamp_utc'], utc=True)
+        end = df.loc[df.index[-1], 'timestamp_utc']
         
-        idx_train_start = idx_start
-        idx_train_end = idx_train_start + readings_3_to_2m
-        idx_warmstart_end = idx_train_end + readings_2_to_1m
-        idx_pred_end = len(df)
+        start_pred = end - DateOffset(months=1)
+        start_warmstart = start_pred - DateOffset(months=1)
+        start_train = start_warmstart - DateOffset(months=1)
 
-        df_train = df.iloc[idx_train_start:idx_train_end].copy()
-        df_warmstart = df.iloc[idx_train_end:idx_warmstart_end].copy()
-        df_predict = df.iloc[idx_warmstart_end:idx_pred_end].copy()
-
+        if start_train < df.loc[0, 'timestamp_utc']:
+            raise ValueError(
+                f"Not enough data. Start time needed for train {start_train}, "
+                f"but earliest possible is {df['timestamp_utc'].iloc[0]}"
+            )
+        
+        mask = (df["timestamp_utc"] >= start_pred) & (df["timestamp_utc"] < end)
+        df_predict = df.loc[mask].copy().reset_index()
+        mask = (df["timestamp_utc"] >= start_warmstart) & (df["timestamp_utc"] < start_pred)
+        df_warmstart = df.loc[mask].copy().reset_index()
+        mask = (df["timestamp_utc"] >= start_train) & (df["timestamp_utc"] < start_warmstart)
+        df_train = df.loc[mask].copy().reset_index()
+        
         result["train_samples"] = len(df_train)
-        result["warmstart_samples"] = len(df_warmstart)
+        result["second_train_samples"] = len(df_warmstart)
         result["predict_samples"] = len(df_predict)
 
         if verbose:
             logger.info(
                 f"  Train: {len(df_train)}, Warmstart: {len(df_warmstart)}, Predict: {len(df_predict)}"
             )
-
-        if len(df_train) < window_size or len(df_warmstart) < window_size:
-            raise ValueError("Insufficient training data.")
-
+        
+        # ===== GET WINDOW SIZES =====
+        periodicity_seconds_train = get_periodicity(df_train)
+        periodicity_seconds_warmstart = get_periodicity(df_warmstart)
+        periodicity_seconds_predict = get_periodicity(df_predict)
+        
+        window_size_train = int(round(24 * 60 * 60 / periodicity_seconds_train))
+        window_size_warmstart = int(round(24 * 60 * 60 / periodicity_seconds_warmstart))
+        window_size_predict = int(round(24 * 60 * 60 / periodicity_seconds_predict))
+        
+        if not (window_size_train == window_size_warmstart == window_size_predict):
+            raise ValueError(f"Window sizes of Train ({window_size_train}), Warmup ({window_size_warmstart}) and Predict ({window_size_predict}) dataset do not equal.")
+        
+        window_size = window_size_train
+        result["window_size"] = window_size
+        
+        if len(df_train) < window_size or len(df_warmstart) < window_size or len(df_predict) < window_size:
+            raise ValueError(f"Insufficient amount of training data. Training data is smaller then window size {window_size}")
+        
         # ===== TRAINING PHASE =====
         temp_model_path = os.path.join(temp_dir, f"{result['filename']}_initial.pt")
         os.makedirs(temp_dir, exist_ok=True)
@@ -710,10 +835,9 @@ def process_single_meter(
 
 def process_batch(
     csv_filepaths: List[str],
-    metadata_dir: str,
     output_csv: str,
     num_workers: int = 4,
-    epochs_train: int = 50,
+    epochs_train: int = 20,
     epochs_warmstart: int = 5,
     verbose: bool = False,
 ):
@@ -733,31 +857,10 @@ def process_batch(
         for filepath in csv_filepaths:
             filename = Path(filepath).stem
 
-            try:
-                metadata_filepath = os.path.join(
-                    metadata_dir, filename.split(".")[0] + ".json"
-                )
-                with open(metadata_filepath, "r") as f:
-                    metadata = json.load(f)
-                window_size = int(
-                    round(24 * 60 * 60 / metadata["common_periodicity_seconds"])
-                )
-            except Exception as e:
-                logger.error(f"Failed to prepare metadata for {filename}: {e}")
-                all_results.append(
-                    {
-                        "filename": filename,
-                        "status": "failed",
-                        "error": str(e),
-                    }
-                )
-                continue
-
             # Submit task
             future = executor.submit(
                 process_single_meter,
                 filepath,
-                window_size,
                 device=device,
                 epochs_train=epochs_train,
                 epochs_warmstart=epochs_warmstart,
@@ -838,7 +941,7 @@ def main():
     parser.add_argument(
         "--epochs-train",
         type=int,
-        default=50,
+        default=10,
         help="Epochs for initial training (default: 50)",
     )
     parser.add_argument(
@@ -870,20 +973,16 @@ def main():
         if os.path.isfile(os.path.join(directory, f))
     ]
     random.seed(seed_value)
-    csv_filepaths = random.sample(all_files, min(10, len(all_files)))
+    csv_filepaths = random.sample(all_files, min(1000, len(all_files)))
 
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    # ===== LOAD METADATA =====
-    metadata_dir = "../metadata_001"
-
     # ===== OUTPUT FILE =====
-    output_csv = "./results_gru_test.csv"
+    output_csv = "./results_gru_test_1000_seed_42_epochs_10.csv"
 
     # ===== RUN BATCH PROCESSING =====
     _ = process_batch(
         csv_filepaths,
-        metadata_dir,
         output_csv,
         num_workers=args.workers,
         epochs_train=args.epochs_train,
