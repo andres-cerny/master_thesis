@@ -159,9 +159,9 @@ class MeterDataset(Dataset):
         self.df["time_delta"].fillna(0, inplace=True)
 
         # Handle missing values
-        self.df["is_missing"] = self.df["Diff"].isna().astype(float)
-        self.df["Diff"].fillna(method="ffill", inplace=True)
-        self.df["Diff"].fillna(0, inplace=True)
+        # self.df["is_missing"] = self.df["Diff"].isna().astype(float)
+        # self.df["Diff"].fillna(method="ffill", inplace=True)
+        # self.df["Diff"].fillna(0, inplace=True)
 
         # Normalize meter readings
         if train:
@@ -377,7 +377,7 @@ def prepare_data_for_prediction(df, scaler):
     test_df["time_delta"] = (
         test_df["timestamp_utc"].diff().dt.total_seconds() / 3600.0
     )
-    print(f"Number of na deltas: {test_df['time_delta'].isna().sum()}")
+
     test_df = test_df.dropna()
     test_df["time_delta_capped"] = np.clip(test_df["time_delta"], 0, 24)
     test_df["time_delta_norm"] = test_df["time_delta_capped"] / 24.0
@@ -671,7 +671,6 @@ def process_single_meter(
         df = df.dropna()
 
         # ===== SPLIT INTO 3 CHUNKS (3–2m, 2–1m, 1m) =====
-        df['timestamp_utc'] = pd.to_datetime(df['timestamp_utc'], utc=True)
         end = df.loc[df.index[-1], 'timestamp_utc']
         
         start_pred = end - DateOffset(months=1)
@@ -973,12 +972,12 @@ def main():
         if os.path.isfile(os.path.join(directory, f))
     ]
     random.seed(seed_value)
-    csv_filepaths = random.sample(all_files, min(1000, len(all_files)))
+    csv_filepaths = random.sample(all_files, min(10, len(all_files)))
 
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
     # ===== OUTPUT FILE =====
-    output_csv = "./results_gru_test_1000_seed_42_epochs_10.csv"
+    output_csv = "./results_gru_test_10_seed_42_epochs_10.csv"
 
     # ===== RUN BATCH PROCESSING =====
     _ = process_batch(
