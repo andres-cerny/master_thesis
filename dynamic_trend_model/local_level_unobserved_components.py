@@ -187,6 +187,7 @@ def calculate_metrics(actuals, predictions, residuals):
             "normalized_rmse": np.nan,
             "median_ape": np.nan,
             "prediction_bias": np.nan,
+            "mpe": np.nan,
             "direction_accuracy": np.nan,
             "medae": np.nan,
             "medae_nz": np.nan,
@@ -210,6 +211,12 @@ def calculate_metrics(actuals, predictions, residuals):
         )
     except Exception:
         metrics["mape"] = np.nan
+        
+    # WAPE
+    denom_nz = np.sum(np.abs(actuals_nz))
+    if denom_nz == 0:
+        metrics["wape_nz"] = np.nan
+    metrics["wape_nz"] = np.sum(np.abs(actuals_nz - predictions_nz)) / denom_nz
 
     # Residual statistics
     metrics["mean_residual"] = np.nanmean(valid_residuals)
@@ -235,6 +242,13 @@ def calculate_metrics(actuals, predictions, residuals):
 
     # Prediction bias
     metrics["prediction_bias"] = np.nanmean(valid_predictions - valid_actuals)
+    
+    # Signed percentage bias (MPE)
+    try:
+        pe_values = (valid_actuals - valid_predictions) / (np.abs(valid_actuals) + 1e-8)
+        metrics["mpe"] = np.nanmean(pe_values)
+    except Exception:
+        metrics["mpe"] = np.nan
 
     # Direction accuracy
     if len(valid_actuals) > 1:
@@ -281,6 +295,11 @@ def calculate_metrics(actuals, predictions, residuals):
             )
         except Exception:
             metrics["mape_nz"] = np.nan
+            
+        denom_nz = np.sum(np.abs(actuals_nz))
+        if denom_nz == 0:
+            metrics["wape_nz"] = np.nan
+        metrics["wape_nz"] = np.sum(np.abs(actuals_nz - predictions_nz)) / denom_nz
 
         metrics["mean_residual_nz"] = np.nanmean(residuals_nz)
         metrics["std_residual_nz"] = np.nanstd(residuals_nz)
@@ -300,6 +319,12 @@ def calculate_metrics(actuals, predictions, residuals):
             metrics["median_ape_nz"] = np.nan
 
         metrics["prediction_bias_nz"] = np.nanmean(predictions_nz - actuals_nz)
+
+        try:
+            pe_values_nz = (actuals_nz - predictions_nz) / (np.abs(actuals_nz) + 1e-8)
+            metrics["mpe_nz"] = np.nanmean(pe_values_nz)
+        except Exception:
+            metrics["mpe_nz"] = np.nan
 
         if len(actuals_nz) > 1:
             actual_diff_nz = np.diff(actuals_nz)
@@ -326,6 +351,7 @@ def calculate_metrics(actuals, predictions, residuals):
         metrics["normalized_rmse_nz"] = np.nan
         metrics["median_ape_nz"] = np.nan
         metrics["prediction_bias_nz"] = np.nan
+        metrics["mpe_nz"] = np.nan
         metrics["direction_accuracy_nz"] = np.nan
 
     return metrics
