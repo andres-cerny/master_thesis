@@ -137,17 +137,19 @@ class LocalLevelWithFixedSlope(sm.tsa.statespace.MLEModel):
 
 def calculate_metrics(actuals, predictions, residuals):
     """
-    Calculate comprehensive metrics for predictions, including both all-data 
-    and non-zero-only metrics
+    Calculate comprehensive metrics for predictions, including both all-data
+    and non-zero-only metrics.
+
+    Properly handles NaN values in actuals and predictions.
 
     Parameters:
     -----------
     actuals : array-like
-        Actual values
+        Actual values (may contain NaN)
     predictions : array-like
-        Predicted values
+        Predicted values (may contain NaN)
     residuals : array-like
-        Residuals (actuals - predictions)
+        Residuals (may contain NaN)
 
     Returns:
     --------
@@ -155,39 +157,68 @@ def calculate_metrics(actuals, predictions, residuals):
     """
     metrics = {}
 
-    # Create mask for non-zero actuals
-    non_zero_mask = actuals != 0
-    non_zero_count = np.sum(non_zero_mask)
+    # Convert to numpy arrays and create mask for valid (non-NaN) values
+    actuals = np.asarray(actuals)
+    predictions = np.asarray(predictions)
+    residuals = np.asarray(residuals)
 
-    # Store the count of zero and non-zero values for reference
+    valid_mask = ~(np.isnan(actuals) | np.isnan(predictions) | np.isnan(residuals))
+    valid_actuals = actuals[valid_mask]
+    valid_predictions = predictions[valid_mask]
+    valid_residuals = residuals[valid_mask]
+
+    # Store counts
     metrics["total_count"] = len(actuals)
-    metrics["non_zero_count"] = non_zero_count
-    metrics["zero_count"] = len(actuals) - non_zero_count
-    metrics["non_zero_percentage"] = (non_zero_count / len(actuals)) * 100 if len(actuals) > 0 else 0
+    metrics["valid_count"] = np.sum(valid_mask)
+    metrics["nan_count"] = np.sum(~valid_mask)
+    metrics["valid_percentage"] = (
+        (np.sum(valid_mask) / len(actuals)) * 100 if len(actuals) > 0 else 0
+    )
+
+    if len(valid_actuals) == 0:
+        logger.warning("No valid (non-NaN) data points for metrics calculation")
+        # Return all NaN metrics
+        metrics.update({
+            "rmse": np.nan,
+            "mae": np.nan,
+            "r2": np.nan,
+            "mape": np.nan,
+            "mean_residual": np.nan,
+            "std_residual": np.nan,
+            "max_residual": np.nan,
+            "min_residual": np.nan,
+            "normalized_rmse": np.nan,
+            "median_ape": np.nan,
+            "prediction_bias": np.nan,
+            "direction_accuracy": np.nan,
+        })
+        return metrics
 
     # ====================
-    # ALL DATA METRICS
+    # ALL VALID DATA METRICS
     # ====================
 
     # Basic metrics
-    metrics["rmse"] = np.sqrt(mean_squared_error(actuals, predictions))
-    metrics["mae"] = mean_absolute_error(actuals, predictions)
-    metrics["r2"] = r2_score(actuals, predictions)
+    metrics["rmse"] = np.sqrt(mean_squared_error(valid_actuals, valid_predictions))
+    metrics["mae"] = mean_absolute_error(valid_actuals, valid_predictions)
+    metrics["r2"] = r2_score(valid_actuals, valid_predictions)
 
-    # MAPE (handle division by zero)
+    # MAPE
     try:
-        metrics["mape"] = mean_absolute_percentage_error(actuals, predictions)
+        metrics["mape"] = mean_absolute_percentage_error(
+            valid_actuals, valid_predictions
+        )
     except Exception:
         metrics["mape"] = np.nan
 
-    # Additional metrics
-    metrics["mean_residual"] = np.mean(residuals)
-    metrics["std_residual"] = np.std(residuals)
-    metrics["max_residual"] = np.max(residuals)
-    metrics["min_residual"] = np.min(residuals)
+    # Residual statistics
+    metrics["mean_residual"] = np.nanmean(valid_residuals)
+    metrics["std_residual"] = np.nanstd(valid_residuals)
+    metrics["max_residual"] = np.nanmax(valid_residuals)
+    metrics["min_residual"] = np.nanmin(valid_residuals)
 
     # RMSE normalized by actual variance
-    actual_var = np.var(actuals)
+    actual_var = np.nanvar(valid_actuals)
     if actual_var > 0:
         metrics["normalized_rmse"] = metrics["rmse"] / np.sqrt(actual_var)
     else:
@@ -195,20 +226,25 @@ def calculate_metrics(actuals, predictions, residuals):
 
     # Median Absolute Percentage Error (robust to outliers)
     try:
-        mape_values = np.abs((actuals - predictions) / (np.abs(actuals) + 1e-8))
-        metrics["median_ape"] = np.median(mape_values)
+        mape_values = np.abs(
+            (valid_actuals - valid_predictions) / (np.abs(valid_actuals) + 1e-8)
+        )
+        metrics["median_ape"] = np.nanmedian(mape_values)
     except Exception:
         metrics["median_ape"] = np.nan
 
     # Prediction bias
-    metrics["prediction_bias"] = np.mean(predictions - actuals)
+    metrics["prediction_bias"] = np.nanmean(valid_predictions - valid_actuals)
 
-    # Direction accuracy (percentage of correct sign predictions)
-    actual_diff = np.diff(actuals)
-    pred_diff = np.diff(predictions)
-    if len(actual_diff) > 0:
-        direction_matches = np.sum((actual_diff > 0) == (pred_diff > 0))
-        metrics["direction_accuracy"] = direction_matches / len(actual_diff)
+    # Direction accuracy
+    if len(valid_actuals) > 1:
+        actual_diff = np.diff(valid_actuals)
+        pred_diff = np.diff(valid_predictions)
+        if len(actual_diff) > 0:
+            direction_matches = np.sum((actual_diff > 0) == (pred_diff > 0))
+            metrics["direction_accuracy"] = direction_matches / len(actual_diff)
+        else:
+            metrics["direction_accuracy"] = np.nan
     else:
         metrics["direction_accuracy"] = np.nan
 
@@ -216,65 +252,67 @@ def calculate_metrics(actuals, predictions, residuals):
     # NON-ZERO ONLY METRICS
     # ====================
 
-    if non_zero_count > 0:
-        # Filter data to non-zero actuals only
-        actuals_nz = actuals[non_zero_mask]
-        predictions_nz = predictions[non_zero_mask]
-        residuals_nz = residuals[non_zero_mask]
+    non_zero_mask = valid_actuals != 0
+    non_zero_count = np.sum(non_zero_mask)
 
-        # Basic metrics for non-zero values
+    metrics["non_zero_count"] = non_zero_count
+    metrics["zero_count"] = len(valid_actuals) - non_zero_count
+    metrics["non_zero_percentage"] = (
+        (non_zero_count / len(valid_actuals)) * 100 if len(valid_actuals) > 0 else 0
+    )
+
+    if non_zero_count > 0:
+        actuals_nz = valid_actuals[non_zero_mask]
+        predictions_nz = valid_predictions[non_zero_mask]
+        residuals_nz = valid_residuals[non_zero_mask]
+
         metrics["rmse_nz"] = np.sqrt(mean_squared_error(actuals_nz, predictions_nz))
         metrics["mae_nz"] = mean_absolute_error(actuals_nz, predictions_nz)
 
-        # R2 for non-zero values
         try:
             metrics["r2_nz"] = r2_score(actuals_nz, predictions_nz)
         except Exception:
             metrics["r2_nz"] = np.nan
 
-        # MAPE for non-zero values (should work since we excluded zeros)
         try:
-            metrics["mape_nz"] = mean_absolute_percentage_error(actuals_nz, predictions_nz)
+            metrics["mape_nz"] = mean_absolute_percentage_error(
+                actuals_nz, predictions_nz
+            )
         except Exception:
             metrics["mape_nz"] = np.nan
 
-        # Residual statistics for non-zero values
-        metrics["mean_residual_nz"] = np.mean(residuals_nz)
-        metrics["std_residual_nz"] = np.std(residuals_nz)
-        metrics["max_residual_nz"] = np.max(residuals_nz)
-        metrics["min_residual_nz"] = np.min(residuals_nz)
+        metrics["mean_residual_nz"] = np.nanmean(residuals_nz)
+        metrics["std_residual_nz"] = np.nanstd(residuals_nz)
+        metrics["max_residual_nz"] = np.nanmax(residuals_nz)
+        metrics["min_residual_nz"] = np.nanmin(residuals_nz)
 
-        # RMSE normalized by actual variance (non-zero)
-        actual_var_nz = np.var(actuals_nz)
+        actual_var_nz = np.nanvar(actuals_nz)
         if actual_var_nz > 0:
             metrics["normalized_rmse_nz"] = metrics["rmse_nz"] / np.sqrt(actual_var_nz)
         else:
             metrics["normalized_rmse_nz"] = np.nan
 
-        # Median Absolute Percentage Error for non-zero values
         try:
             mape_values_nz = np.abs((actuals_nz - predictions_nz) / np.abs(actuals_nz))
-            metrics["median_ape_nz"] = np.median(mape_values_nz)
+            metrics["median_ape_nz"] = np.nanmedian(mape_values_nz)
         except Exception:
             metrics["median_ape_nz"] = np.nan
 
-        # Prediction bias for non-zero values
-        metrics["prediction_bias_nz"] = np.mean(predictions_nz - actuals_nz)
+        metrics["prediction_bias_nz"] = np.nanmean(predictions_nz - actuals_nz)
 
-        # Direction accuracy for non-zero values
         if len(actuals_nz) > 1:
             actual_diff_nz = np.diff(actuals_nz)
             pred_diff_nz = np.diff(predictions_nz)
             if len(actual_diff_nz) > 0:
                 direction_matches_nz = np.sum((actual_diff_nz > 0) == (pred_diff_nz > 0))
-                metrics["direction_accuracy_nz"] = direction_matches_nz / len(actual_diff_nz)
+                metrics["direction_accuracy_nz"] = direction_matches_nz / len(
+                    actual_diff_nz
+                )
             else:
                 metrics["direction_accuracy_nz"] = np.nan
         else:
             metrics["direction_accuracy_nz"] = np.nan
-
     else:
-        # If no non-zero values exist, set all non-zero metrics to NaN
         metrics["rmse_nz"] = np.nan
         metrics["mae_nz"] = np.nan
         metrics["r2_nz"] = np.nan
@@ -338,6 +376,7 @@ def process_single_meter(
     csv_filepath: str,
     device: Optional[torch.device] = None,
     verbose: bool = False,
+    predictions_output_csv: Optional[str] = None
 ) -> Dict:
     """
     Process a single water meter CSV file with the LocalLevelWithFixedSlope model.
@@ -459,6 +498,17 @@ def process_single_meter(
         t_start_train = time.time()
         model_train = LocalLevelWithFixedSlope(y_train)
         res_train = model_train.fit(disp=False)
+        
+        result["converged_train"] = res_train.mle_retvals['converged']
+
+        if not res_train.mle_retvals['converged']:
+            logger.info(f"Did not converge because of {res_train.mle_retvals['warnflag']} at value {res_train.mle_retvals['gopt']}")
+            result['warnflag_train'] = res_train.mle_retvals['warnflag']
+            result["gopt_train"] = res_train.mle_retvals['gopt']
+        else:
+            result['warnflag_train'] = ''
+            result["gopt_train"] = ''
+        
         t_end_train = time.time()
         result["train_time_seconds"] = t_end_train - t_start_train
 
@@ -470,6 +520,8 @@ def process_single_meter(
         last_state_mean = filtered_state[:, -1].copy()
         last_state_cov = filtered_cov[:, :, -1].copy()
 
+        # Store parameters
+        theta_train = res_train.params
         result["train_loglike"] = res_train.llf
 
         # ----------------------------------------------------------------------
@@ -485,6 +537,17 @@ def process_single_meter(
                 initial_state=last_state_mean, initial_state_cov=last_state_cov
             )
         res_second = model_second.fit(disp=False)
+        
+        result["converged_second"] = res_second.mle_retvals['converged']
+        
+        if not res_second.mle_retvals['converged']:
+            logger.info(f"Did not converge because of {res_second.mle_retvals['warnflag']} at value {res_second.mle_retvals['gopt']}")
+            result['warnflag_second'] = res_second.mle_retvals['warnflag']
+            result["gopt_second"] = res_second.mle_retvals['gopt']
+        else:
+            result['warnflag_second'] = ''
+            result["gopt_second"] = ''        
+        
         t_end_second = time.time()
         result["second_train_time_seconds"] = t_end_second - t_start_second
 
@@ -494,6 +557,7 @@ def process_single_meter(
         last_state_mean_2 = filtered_state_2[:, -1].copy()
         last_state_cov_2 = filtered_cov_2[:, :, -1].copy()
 
+        theta_second = res_second.params  # updated variances
         result["second_train_loglike"] = res_second.llf
 
         # ----------------------------------------------------------------------
@@ -508,27 +572,30 @@ def process_single_meter(
                 initial_state=last_state_mean_2, initial_state_cov=last_state_cov_2
             )
 
-        # Filter to get one-step-ahead predictions for this segment
-        res_pred = model_pred.filter(model_pred.start_params)
+        # Run Kalman filter with learned parameters (no re-fit here)
+        res_pred = model_pred.filter(theta_second)
         # get_prediction with dynamic=True gives one-step-ahead in-sample predictions
         pred_obj = res_pred.get_prediction()
         pred_mean = pred_obj.predicted_mean
+        pred_mean = np.asarray(pred_mean, dtype=float)
+        pred_mean = np.clip(pred_mean, 0.0, None)
         t_end_pred = time.time()
         result["prediction_time_seconds"] = t_end_pred - t_start_pred
 
         timestamps_pred = df_predict["timestamp_utc"].values
         actuals = y_pred_segment
-        mask = ~np.isnan(actuals)
-        timestamps_used = timestamps_pred[mask]
-        actuals_used = actuals[mask]
-        predictions_used = pred_mean[mask]
-
+        predictions_used = pred_mean
+        
         predictions_df = build_results_df(
-            timestamps_used, actuals_used, predictions_used
+            timestamps_pred, actuals, predictions_used
         )
+        
+        if predictions_output_csv is not None:
+            predictions_df.to_csv(predictions_output_csv, index=False)
+            
         # ===== METRICS =====
         residuals = predictions_df["residual"].values
-        metrics = calculate_metrics(actuals_used, predictions_used, residuals)
+        metrics = calculate_metrics(actuals, predictions_used, residuals)
         for key, value in metrics.items():
             result[f"metric_{key}"] = value
 
@@ -679,7 +746,7 @@ def main():
     #csv_filepaths = ['../data_w_diff_001/103458.csv']
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    output_csv = "./results_local_trend_1000_seed_42.csv"
+    output_csv = "./results_local_trend_1000_seed_42_fixed_params_clipped.csv"
 
     _ = process_batch(
         csv_filepaths,
