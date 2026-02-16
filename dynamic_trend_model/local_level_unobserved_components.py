@@ -145,26 +145,12 @@ def calculate_seasonal_period(
 # METRICS CALCULATION
 # ============================================================================
 
-
 def calculate_metrics(actuals, predictions, residuals):
     """
     Calculate comprehensive metrics for predictions, including both all-data
     and non-zero-only metrics.
 
     Properly handles NaN values in actuals and predictions.
-
-    Parameters:
-    -----------
-    actuals : array-like
-        Actual values (may contain NaN)
-    predictions : array-like
-        Predicted values (may contain NaN)
-    residuals : array-like
-        Residuals (may contain NaN)
-
-    Returns:
-    --------
-    dict : Dictionary containing all metrics with suffixes for non-zero variants
     """
     metrics = {}
 
@@ -202,6 +188,8 @@ def calculate_metrics(actuals, predictions, residuals):
             "median_ape": np.nan,
             "prediction_bias": np.nan,
             "direction_accuracy": np.nan,
+            "medae": np.nan,
+            "medae_nz": np.nan,
         })
         return metrics
 
@@ -213,6 +201,7 @@ def calculate_metrics(actuals, predictions, residuals):
     metrics["rmse"] = np.sqrt(mean_squared_error(valid_actuals, valid_predictions))
     metrics["mae"] = mean_absolute_error(valid_actuals, valid_predictions)
     metrics["r2"] = r2_score(valid_actuals, valid_predictions)
+    metrics["medae"] = np.nanmedian(np.abs(valid_actuals - valid_predictions))
 
     # MAPE
     try:
@@ -279,6 +268,7 @@ def calculate_metrics(actuals, predictions, residuals):
 
         metrics["rmse_nz"] = np.sqrt(mean_squared_error(actuals_nz, predictions_nz))
         metrics["mae_nz"] = mean_absolute_error(actuals_nz, predictions_nz)
+        metrics["medae_nz"] = np.nanmedian(np.abs(actuals_nz - predictions_nz))
 
         try:
             metrics["r2_nz"] = r2_score(actuals_nz, predictions_nz)
@@ -326,6 +316,7 @@ def calculate_metrics(actuals, predictions, residuals):
     else:
         metrics["rmse_nz"] = np.nan
         metrics["mae_nz"] = np.nan
+        metrics["medae_nz"] = np.nan
         metrics["r2_nz"] = np.nan
         metrics["mape_nz"] = np.nan
         metrics["mean_residual_nz"] = np.nan
@@ -338,6 +329,7 @@ def calculate_metrics(actuals, predictions, residuals):
         metrics["direction_accuracy_nz"] = np.nan
 
     return metrics
+
 
 
 # ============================================================================
