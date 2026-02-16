@@ -180,6 +180,7 @@ def calculate_metrics(actuals, predictions, residuals):
             "mae": np.nan,
             "r2": np.nan,
             "mape": np.nan,
+            "wape": np.nan,
             "mean_residual": np.nan,
             "std_residual": np.nan,
             "max_residual": np.nan,
@@ -191,6 +192,8 @@ def calculate_metrics(actuals, predictions, residuals):
             "direction_accuracy": np.nan,
             "medae": np.nan,
             "medae_nz": np.nan,
+            "p75_ae": np.nan,
+            "p90_ae": np.nan,
         })
         return metrics
 
@@ -213,16 +216,21 @@ def calculate_metrics(actuals, predictions, residuals):
         metrics["mape"] = np.nan
         
     # WAPE
-    denom_nz = np.sum(np.abs(actuals_nz))
-    if denom_nz == 0:
-        metrics["wape_nz"] = np.nan
-    metrics["wape_nz"] = np.sum(np.abs(actuals_nz - predictions_nz)) / denom_nz
+    denom = np.sum(np.abs(valid_actuals))
+    if denom == 0:
+        metrics["wape"] = np.nan
+    metrics["wape"] = np.sum(np.abs(valid_actuals - valid_predictions)) / denom
 
     # Residual statistics
     metrics["mean_residual"] = np.nanmean(valid_residuals)
     metrics["std_residual"] = np.nanstd(valid_residuals)
     metrics["max_residual"] = np.nanmax(valid_residuals)
     metrics["min_residual"] = np.nanmin(valid_residuals)
+    
+    # 75th and 90th percentile of absolute error (size of “typical worst” errors)
+    abs_errors = np.abs(valid_actuals - valid_predictions)
+    metrics["p75_ae"] = np.nanpercentile(abs_errors, 75)
+    metrics["p90_ae"] = np.nanpercentile(abs_errors, 90)
 
     # RMSE normalized by actual variance
     actual_var = np.nanvar(valid_actuals)
@@ -305,6 +313,11 @@ def calculate_metrics(actuals, predictions, residuals):
         metrics["std_residual_nz"] = np.nanstd(residuals_nz)
         metrics["max_residual_nz"] = np.nanmax(residuals_nz)
         metrics["min_residual_nz"] = np.nanmin(residuals_nz)
+        
+        # 75th and 90th percentile AE on non-zero subset
+        abs_errors_nz = np.abs(actuals_nz - predictions_nz)
+        metrics["p75_ae_nz"] = np.nanpercentile(abs_errors_nz, 75)
+        metrics["p90_ae_nz"] = np.nanpercentile(abs_errors_nz, 90)
 
         actual_var_nz = np.nanvar(actuals_nz)
         if actual_var_nz > 0:
@@ -344,6 +357,7 @@ def calculate_metrics(actuals, predictions, residuals):
         metrics["medae_nz"] = np.nan
         metrics["r2_nz"] = np.nan
         metrics["mape_nz"] = np.nan
+        metrics["wape_nz"] = np.nan
         metrics["mean_residual_nz"] = np.nan
         metrics["std_residual_nz"] = np.nan
         metrics["max_residual_nz"] = np.nan
@@ -353,6 +367,8 @@ def calculate_metrics(actuals, predictions, residuals):
         metrics["prediction_bias_nz"] = np.nan
         metrics["mpe_nz"] = np.nan
         metrics["direction_accuracy_nz"] = np.nan
+        metrics["p75_ae_nz"] = np.nan
+        metrics["p90_ae_nz"] = np.nan
 
     return metrics
 
