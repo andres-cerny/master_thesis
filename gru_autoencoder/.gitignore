@@ -1,3 +1,4 @@
 temp_models/*
-gru_batch_processor.log
+*.log
 result*
+*pt

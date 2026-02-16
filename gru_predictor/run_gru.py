@@ -701,6 +701,7 @@ def process_single_meter(
     epochs_train: int = 20,
     epochs_warmstart: int = 5,
     verbose: bool = False,
+    predictions_output_csv: Optional[str] = None
 ) -> Dict:
     """
     Process a single water meter CSV file through training and prediction pipeline
@@ -871,6 +872,9 @@ def process_single_meter(
         )
         t_end_pred = time.time()
         result["prediction_time_seconds"] = t_end_pred - t_start_pred
+        
+        if predictions_output_csv is not None:
+            predictions_df.to_csv(predictions_output_csv, index=False)
         # --------------------------------
 
         # ===== CALCULATE METRICS =====
