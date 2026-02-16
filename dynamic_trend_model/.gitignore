@@ -3,3 +3,4 @@ local_trend_batch_processor.log
 __pycache__/*
 __pycache__
 result*
+*.log

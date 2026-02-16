@@ -127,6 +127,7 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
 
                 for _ in range(nans_needed - 1):
                     expected_next = prev_reading_time + pd.Timedelta(seconds=gap_period)
+                    expected_next = expected_next.round('s')
                     row_data = {
                         timestamp_col: expected_next,
                         'hodnota': np.nan
@@ -506,12 +507,12 @@ def main():
 def test():
     #df = pd.read_csv()
     try:
-        filled_df, diagnostics = process_file_with_gap_filling('data_w_diff_001/151504.csv', 'data_w_diff_001_resampled', 'metadata_resample')
+        diagnostics = process_file_with_gap_filling('../data_w_diff_001/137402.csv', '.', '../metadata_resample')
     except Exception as e:
         print(f"Fuck {e}")
     print(diagnostics)
-    return filled_df, diagnostics
+    return diagnostics
     
 
 if __name__ == "__main__":
-    main()
+    test()

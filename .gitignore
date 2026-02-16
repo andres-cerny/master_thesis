@@ -16,3 +16,5 @@ data_w_diff_001_resampled/*
 __pycache__/*
 __pycache__
 filled_data_complete.csv
+*.log
+*.csv
