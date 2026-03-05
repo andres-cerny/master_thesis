@@ -30,13 +30,7 @@ import json
 import pandas as pd
 import numpy as np
 import torch
-from sklearn.metrics import (
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score,
-    mean_absolute_percentage_error,
-)
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
 from pathlib import Path
 import logging
 import traceback
@@ -46,18 +40,45 @@ import random
 from tqdm import tqdm
 import time
 import sys
+import pickle
+import signal
+from contextlib import contextmanager
 from statsmodels.tsa.statespace.structural import UnobservedComponents
 from pandas.tseries.offsets import DateOffset
+from numpy.random import default_rng
 
 
-from resample import fill_gaps_with_periodicity_adaptive
+from resample import fill_gaps_with_periodicity_adaptive, get_periodicity
+from calculate_metrics import calculate_metrics
 
 import warnings
 from statsmodels.tools.sm_exceptions import SpecificationWarning
 from scipy.sparse import SparseEfficiencyWarning
+from statsmodels.tools.sm_exceptions import ConvergenceWarning
 
 warnings.filterwarnings("ignore", category=SpecificationWarning)
 warnings.filterwarnings("ignore", category=SparseEfficiencyWarning)
+warnings.filterwarnings("ignore", category=ConvergenceWarning)
+
+
+# ============================================================================
+# TIMEOUT ERROR SETUP
+# ============================================================================
+#class FitTimeoutError(TimeoutError):
+#    pass
+#
+#@contextmanager
+#def time_limit(seconds: int):
+#    def handler(signum, frame):
+#        raise FitTimeoutError(f"Model fitting exceeded {seconds} seconds")
+#
+#    old_handler = signal.signal(signal.SIGALRM, handler)
+#    signal.alarm(seconds)
+#    try:
+#        yield
+#    finally:
+#        signal.alarm(0)
+#        signal.signal(signal.SIGALRM, old_handler)
 
 
 # ============================================================================
@@ -137,241 +158,8 @@ def calculate_seasonal_period(
         cycle_seconds = float(seasonal_cycle)
 
     seasonal_period = int(np.round(cycle_seconds / periodicity_seconds))
-    seasonal_period = max(2, seasonal_period)  # Ensure at least 2 steps
+    
     return seasonal_period
-
-
-# ============================================================================
-# METRICS CALCULATION
-# ============================================================================
-
-def calculate_metrics(actuals, predictions, residuals):
-    """
-    Calculate comprehensive metrics for predictions, including both all-data
-    and non-zero-only metrics.
-
-    Properly handles NaN values in actuals and predictions.
-    """
-    metrics = {}
-
-    # Convert to numpy arrays and create mask for valid (non-NaN) values
-    actuals = np.asarray(actuals)
-    predictions = np.asarray(predictions)
-    residuals = np.asarray(residuals)
-
-    valid_mask = ~(np.isnan(actuals) | np.isnan(predictions) | np.isnan(residuals))
-    valid_actuals = actuals[valid_mask]
-    valid_predictions = predictions[valid_mask]
-    valid_residuals = residuals[valid_mask]
-
-    # Store counts
-    metrics["total_count"] = len(actuals)
-    metrics["valid_count"] = np.sum(valid_mask)
-    metrics["nan_count"] = np.sum(~valid_mask)
-    metrics["valid_percentage"] = (
-        (np.sum(valid_mask) / len(actuals)) * 100 if len(actuals) > 0 else 0
-    )
-
-    if len(valid_actuals) == 0:
-        logger.warning("No valid (non-NaN) data points for metrics calculation")
-        # Return all NaN metrics
-        metrics.update({
-            "rmse": np.nan,
-            "mae": np.nan,
-            "r2": np.nan,
-            "mape": np.nan,
-            "wape": np.nan,
-            "mean_residual": np.nan,
-            "std_residual": np.nan,
-            "max_residual": np.nan,
-            "min_residual": np.nan,
-            "normalized_rmse": np.nan,
-            "median_ape": np.nan,
-            "prediction_bias": np.nan,
-            "mpe": np.nan,
-            "direction_accuracy": np.nan,
-            "medae": np.nan,
-            "medae_nz": np.nan,
-            "p75_ae": np.nan,
-            "p90_ae": np.nan,
-        })
-        return metrics
-
-    # ====================
-    # ALL VALID DATA METRICS
-    # ====================
-
-    # Basic metrics
-    metrics["rmse"] = np.sqrt(mean_squared_error(valid_actuals, valid_predictions))
-    metrics["mae"] = mean_absolute_error(valid_actuals, valid_predictions)
-    metrics["r2"] = r2_score(valid_actuals, valid_predictions)
-    metrics["medae"] = np.nanmedian(np.abs(valid_actuals - valid_predictions))
-
-    # MAPE
-    try:
-        metrics["mape"] = mean_absolute_percentage_error(
-            valid_actuals, valid_predictions
-        )
-    except Exception:
-        metrics["mape"] = np.nan
-        
-    # WAPE
-    denom = np.sum(np.abs(valid_actuals))
-    if denom == 0:
-        metrics["wape"] = np.nan
-    metrics["wape"] = np.sum(np.abs(valid_actuals - valid_predictions)) / denom
-
-    # Residual statistics
-    metrics["mean_residual"] = np.nanmean(valid_residuals)
-    metrics["std_residual"] = np.nanstd(valid_residuals)
-    metrics["max_residual"] = np.nanmax(valid_residuals)
-    metrics["min_residual"] = np.nanmin(valid_residuals)
-    
-    # 75th and 90th percentile of absolute error (size of “typical worst” errors)
-    abs_errors = np.abs(valid_actuals - valid_predictions)
-    metrics["p75_ae"] = np.nanpercentile(abs_errors, 75)
-    metrics["p90_ae"] = np.nanpercentile(abs_errors, 90)
-
-    # RMSE normalized by actual variance
-    actual_var = np.nanvar(valid_actuals)
-    if actual_var > 0:
-        metrics["normalized_rmse"] = metrics["rmse"] / np.sqrt(actual_var)
-    else:
-        metrics["normalized_rmse"] = np.nan
-
-    # Median Absolute Percentage Error (robust to outliers)
-    try:
-        mape_values = np.abs(
-            (valid_actuals - valid_predictions) / (np.abs(valid_actuals) + 1e-8)
-        )
-        metrics["median_ape"] = np.nanmedian(mape_values)
-    except Exception:
-        metrics["median_ape"] = np.nan
-
-    # Prediction bias
-    metrics["prediction_bias"] = np.nanmean(valid_predictions - valid_actuals)
-    
-    # Signed percentage bias (MPE)
-    try:
-        pe_values = (valid_actuals - valid_predictions) / (np.abs(valid_actuals) + 1e-8)
-        metrics["mpe"] = np.nanmean(pe_values)
-    except Exception:
-        metrics["mpe"] = np.nan
-
-    # Direction accuracy
-    if len(valid_actuals) > 1:
-        actual_diff = np.diff(valid_actuals)
-        pred_diff = np.diff(valid_predictions)
-        if len(actual_diff) > 0:
-            direction_matches = np.sum((actual_diff > 0) == (pred_diff > 0))
-            metrics["direction_accuracy"] = direction_matches / len(actual_diff)
-        else:
-            metrics["direction_accuracy"] = np.nan
-    else:
-        metrics["direction_accuracy"] = np.nan
-
-    # ====================
-    # NON-ZERO ONLY METRICS
-    # ====================
-
-    non_zero_mask = valid_actuals != 0
-    non_zero_count = np.sum(non_zero_mask)
-
-    metrics["non_zero_count"] = non_zero_count
-    metrics["zero_count"] = len(valid_actuals) - non_zero_count
-    metrics["non_zero_percentage"] = (
-        (non_zero_count / len(valid_actuals)) * 100 if len(valid_actuals) > 0 else 0
-    )
-
-    if non_zero_count > 0:
-        actuals_nz = valid_actuals[non_zero_mask]
-        predictions_nz = valid_predictions[non_zero_mask]
-        residuals_nz = valid_residuals[non_zero_mask]
-
-        metrics["rmse_nz"] = np.sqrt(mean_squared_error(actuals_nz, predictions_nz))
-        metrics["mae_nz"] = mean_absolute_error(actuals_nz, predictions_nz)
-        metrics["medae_nz"] = np.nanmedian(np.abs(actuals_nz - predictions_nz))
-
-        try:
-            metrics["r2_nz"] = r2_score(actuals_nz, predictions_nz)
-        except Exception:
-            metrics["r2_nz"] = np.nan
-
-        try:
-            metrics["mape_nz"] = mean_absolute_percentage_error(
-                actuals_nz, predictions_nz
-            )
-        except Exception:
-            metrics["mape_nz"] = np.nan
-            
-        denom_nz = np.sum(np.abs(actuals_nz))
-        if denom_nz == 0:
-            metrics["wape_nz"] = np.nan
-        metrics["wape_nz"] = np.sum(np.abs(actuals_nz - predictions_nz)) / denom_nz
-
-        metrics["mean_residual_nz"] = np.nanmean(residuals_nz)
-        metrics["std_residual_nz"] = np.nanstd(residuals_nz)
-        metrics["max_residual_nz"] = np.nanmax(residuals_nz)
-        metrics["min_residual_nz"] = np.nanmin(residuals_nz)
-        
-        # 75th and 90th percentile AE on non-zero subset
-        abs_errors_nz = np.abs(actuals_nz - predictions_nz)
-        metrics["p75_ae_nz"] = np.nanpercentile(abs_errors_nz, 75)
-        metrics["p90_ae_nz"] = np.nanpercentile(abs_errors_nz, 90)
-
-        actual_var_nz = np.nanvar(actuals_nz)
-        if actual_var_nz > 0:
-            metrics["normalized_rmse_nz"] = metrics["rmse_nz"] / np.sqrt(actual_var_nz)
-        else:
-            metrics["normalized_rmse_nz"] = np.nan
-
-        try:
-            mape_values_nz = np.abs((actuals_nz - predictions_nz) / np.abs(actuals_nz))
-            metrics["median_ape_nz"] = np.nanmedian(mape_values_nz)
-        except Exception:
-            metrics["median_ape_nz"] = np.nan
-
-        metrics["prediction_bias_nz"] = np.nanmean(predictions_nz - actuals_nz)
-
-        try:
-            pe_values_nz = (actuals_nz - predictions_nz) / (np.abs(actuals_nz) + 1e-8)
-            metrics["mpe_nz"] = np.nanmean(pe_values_nz)
-        except Exception:
-            metrics["mpe_nz"] = np.nan
-
-        if len(actuals_nz) > 1:
-            actual_diff_nz = np.diff(actuals_nz)
-            pred_diff_nz = np.diff(predictions_nz)
-            if len(actual_diff_nz) > 0:
-                direction_matches_nz = np.sum((actual_diff_nz > 0) == (pred_diff_nz > 0))
-                metrics["direction_accuracy_nz"] = direction_matches_nz / len(
-                    actual_diff_nz
-                )
-            else:
-                metrics["direction_accuracy_nz"] = np.nan
-        else:
-            metrics["direction_accuracy_nz"] = np.nan
-    else:
-        metrics["rmse_nz"] = np.nan
-        metrics["mae_nz"] = np.nan
-        metrics["medae_nz"] = np.nan
-        metrics["r2_nz"] = np.nan
-        metrics["mape_nz"] = np.nan
-        metrics["wape_nz"] = np.nan
-        metrics["mean_residual_nz"] = np.nan
-        metrics["std_residual_nz"] = np.nan
-        metrics["max_residual_nz"] = np.nan
-        metrics["min_residual_nz"] = np.nan
-        metrics["normalized_rmse_nz"] = np.nan
-        metrics["median_ape_nz"] = np.nan
-        metrics["prediction_bias_nz"] = np.nan
-        metrics["mpe_nz"] = np.nan
-        metrics["direction_accuracy_nz"] = np.nan
-        metrics["p75_ae_nz"] = np.nan
-        metrics["p90_ae_nz"] = np.nan
-
-    return metrics
-
 
 
 # ============================================================================
@@ -427,6 +215,262 @@ def build_results_df(timestamps, actuals, predictions):
     result_df["is_anomaly"] = (np.abs(result_df["anomaly_score"]) > 4).astype(int)
     return result_df
 
+# ===================================================================
+# REMOVE METERS THAT COULD TAKE TOO LONG TO TRAIN
+# ===================================================================
+def can_long_run_length(train_samples, train_samples_filled, periodicity_seconds):
+    '''
+    Raises an error if current meter is expected to run too long
+    This check is done by pretrained model
+    '''
+    with open("./train_time_tree.pkl", "rb") as f:
+        clf = pickle.load(f)
+
+    number_of_gaps = train_samples_filled - train_samples
+    sgn_of_gaps = np.sign(number_of_gaps)
+    percentage_of_gaps = np.abs(number_of_gaps / train_samples_filled)
+
+    x_tree = pd.DataFrame(
+        [{
+            "percentage_of_gaps": percentage_of_gaps,
+            "sgn_of_gaps": sgn_of_gaps,
+            "periodicity_seconds": periodicity_seconds,
+        }]
+    )
+    y_pred_tree = clf.predict(x_tree)[0]
+    
+    if y_pred_tree == 1:
+        return True
+
+    return False
+        
+
+# ============================================================================
+# TRAIN MODEL
+# ============================================================================
+def train_model(df_train, seasonal_period_steps, result, initial_train=True, init_state_mean=None, init_state_cov=None, freq_seasonal=None, stochastic_freq_seasonal=None):
+    
+    y_train = df_train["Diff"].values.astype(float)
+    
+    train_period = 'train'
+    if not initial_train:
+        train_period = 'second'
+    
+    t_start_train = time.time()
+    try:
+        model_train = UnobservedComponents(
+            endog=y_train,
+            level="local level",  # local level only, no slope
+            seasonal=seasonal_period_steps,
+            freq_seasonal=freq_seasonal,
+            stochastic_level=True,
+            stochastic_seasonal=False,
+            stochastic_freq_seasonal=stochastic_freq_seasonal,
+        )
+        
+        if init_state_mean is not None and init_state_cov is not None:
+            model_train.initialize_known(
+                initial_state=init_state_mean, initial_state_cov=init_state_cov
+            ) 
+                    
+        res_train = model_train.fit(disp=False)
+    except Exception as e:
+        raise ValueError(f"Failed to fit {train_period} training model: {e}")
+    
+    result[f"converged_{train_period}"] = res_train.mle_retvals['converged']
+    if not res_train.mle_retvals['converged']:
+        #logger.info(f"Did not converge because of {res_train.mle_retvals['warnflag']} at value {res_train.mle_retvals['gopt']}")
+        result[f'warnflag_{train_period}'] = res_train.mle_retvals['warnflag']
+        result[f"gopt_{train_period}"] = res_train.mle_retvals['gopt']
+    else:
+        result[f'warnflag_{train_period}'] = ''
+        result[f"gopt_train_{train_period}"] = ''
+        
+    t_end_train = time.time()
+    result[f"{train_period}_train_time_seconds"] = t_end_train - t_start_train
+    
+    # Get filtered states at end of training segment
+    filtered_state = res_train.filter_results.filtered_state
+    filtered_cov = res_train.filter_results.filtered_state_cov
+    last_state_mean = filtered_state[:, -1].copy()
+    last_state_cov = filtered_cov[:, :, -1].copy()
+    
+    theta_train = res_train.params
+    result[f"{train_period}_train_loglike"] = res_train.llf
+    
+    return last_state_mean, last_state_cov, theta_train
+
+# ============================================================================
+# PREDICT MODEL
+# ============================================================================
+def predict_model(df_predict, seasonal_period_steps, result, init_state_mean, init_state_cov, theta, freq_seasonal=None, stochastic_freq_seasonal=None):
+    y_pred_segment = df_predict["Diff"].values.astype(float)
+    
+    t_start_pred = time.time()
+    try:
+        model_pred = UnobservedComponents(
+            endog=y_pred_segment,
+            level="local level",
+            seasonal=seasonal_period_steps,
+            freq_seasonal=freq_seasonal,
+            stochastic_level=True,
+            stochastic_seasonal=True,
+            stochastic_freq_seasonal=stochastic_freq_seasonal,
+        )
+        
+        # Initialize from last state of second training segment
+        if init_state_mean is not None and init_state_cov is not None:
+            model_pred.initialize_known(
+                initial_state=init_state_mean, initial_state_cov=init_state_cov
+            )
+            
+        # Filter with parameters from second training
+        res_pred = model_pred.filter(theta)
+        # Get one-step-ahead predictions
+        pred_obj = res_pred.get_prediction()
+        pred_mean = pred_obj.predicted_mean
+        pred_mean = np.asarray(pred_mean, dtype=float)
+        pred_mean = np.clip(pred_mean, 0.0, None)
+        
+    except Exception as e:
+        raise ValueError(f"Failed to generate predictions: {e}")
+    
+    t_end_pred = time.time()
+    result["prediction_time_seconds"] = t_end_pred - t_start_pred
+
+    return pred_mean
+
+def split_df(df_raw, seed, result, test_window_days=100, min_periodicity_month_train=20):
+    '''
+    Split df into 3 chunks for pre-training, training and prediction
+    '''
+    df_raw["timestamp_utc"] = pd.to_datetime(df_raw["timestamp_utc"], utc=True)
+    
+    min_ts = df_raw["timestamp_utc"].min()
+    max_ts = df_raw["timestamp_utc"].max()
+
+    span = max_ts - min_ts
+    if span < pd.Timedelta(days=test_window_days):
+        raise ValueError(
+            f"Not enough data. Do not have at least {test_window_days} days of data."
+        )
+        
+    min_window = pd.Timedelta(days=test_window_days)
+    latest_start = max_ts - min_window
+       
+    # single random draw between min_ts and latest_start for this meter (reproducible for this seed)
+    rng = default_rng(seed)
+    u = rng.random()
+    
+    rand_start = min_ts + (latest_start - min_ts) * u
+    rand_start = pd.to_datetime(rand_start)
+    rand_end = rand_start + min_window
+
+    df_3m = df_raw[(df_raw["timestamp_utc"] >= rand_start) &
+                   (df_raw["timestamp_utc"] < rand_end)].copy().reset_index(drop=True)
+    
+    periodicity_sec_df_3m = get_periodicity(df_3m)
+    
+    window_days = 30
+    if periodicity_sec_df_3m < min_periodicity_month_train * 60:
+        window_days = 14
+        
+    result['train_predict_window_days'] = window_days
+    
+    end = df_3m.loc[df_3m.index[-1], "timestamp_utc"]
+    start_pred = end - DateOffset(days=window_days)
+    start_second = start_pred - DateOffset(days=window_days)
+    start_train = start_second - DateOffset(days=window_days)
+    
+    #if 3*window_size did not fit into df_3m choose the last 3 window_size from df_raw
+    if start_train < df_3m.loc[0, "timestamp_utc"]:
+        end = df_raw.loc[df_raw.index[-1], "timestamp_utc"]
+        start_pred = end - DateOffset(days=window_days)
+        start_second = start_pred - DateOffset(days=window_days)
+        start_train = start_second - DateOffset(days=window_days)
+    
+        if start_train < df_raw.loc[0, "timestamp_utc"]:
+            raise ValueError(
+                f"Not enough data. Start time needed for train {start_train}, "
+                f"but earliest possible is {df_3m['timestamp_utc'].iloc[0]}"
+            )
+        
+    mask = (df_3m["timestamp_utc"] >= start_pred) & (df_3m["timestamp_utc"] < end)
+    df_predict = df_3m.loc[mask].copy().reset_index(drop=True)
+    
+    mask = (df_3m["timestamp_utc"] >= start_second) & (
+        df_3m["timestamp_utc"] < start_pred
+    )
+    df_second = df_3m.loc[mask].copy().reset_index(drop=True)
+    
+    mask = (df_3m["timestamp_utc"] >= start_train) & (
+        df_3m["timestamp_utc"] < start_second
+    )
+    df_train = df_3m.loc[mask].copy().reset_index(drop=True)
+    
+    result["train_samples"] = len(df_train)
+    result["second_train_samples"] = len(df_second)
+    result["predict_samples"] = len(df_predict)
+    
+    return df_train, df_second, df_predict
+
+def resample_dfs(df_train, df_second, df_predict, result, verbose, leniency = 0.333):
+    '''
+    leniency = max percentage time difference (in terms of percentage of a period) between last two steps in dfs with different periods
+    '''
+    # ===== RESAMPLE / FILL GAPS =====
+    df_train, diag_train = fill_gaps_with_periodicity_adaptive(
+        df_train, timestamp_col="timestamp_utc"
+    )
+    periodicity_seconds_train = diag_train["periodicity_used_seconds"]
+    df_second, diag_second = fill_gaps_with_periodicity_adaptive(
+        df_second, timestamp_col="timestamp_utc"
+    )
+    periodicity_seconds_second = diag_second["periodicity_used_seconds"]
+    df_predict, diag_predict = fill_gaps_with_periodicity_adaptive(
+        df_predict, timestamp_col="timestamp_utc"
+    )
+    periodicity_seconds_predict = diag_predict["periodicity_used_seconds"]
+    result["train_samples_filled"] = len(df_train)
+    result["second_train_samples_filled"] = len(df_second)
+    result["predict_samples_filled"] = len(df_predict)
+    result["periodicity_seconds_train"] = periodicity_seconds_train
+    result["periodicity_seconds_second"] = periodicity_seconds_second
+    result["periodicity_seconds_predict"] = periodicity_seconds_predict
+    periods = [
+        periodicity_seconds_train,
+        periodicity_seconds_second,
+        periodicity_seconds_predict,
+    ]
+    p_min = min(periods)
+    if p_min == 0:
+        raise ValueError(
+                        "One of periodicities is equal to 0"
+                        f"Periodicity Train: {periodicity_seconds_train}, "
+                        f"Periodicity Second: {periodicity_seconds_second}, "
+                        f"Periodicity Predict: {periodicity_seconds_predict}."
+                        )
+    
+    leniency_seconds = p_min * leniency
+    seasonal_period_steps = calculate_seasonal_period(p_min)
+    
+    all_within_pct = all(abs(p*seasonal_period_steps - p_min*seasonal_period_steps) <= leniency_seconds for p in periods)
+    if not all_within_pct:
+        raise ValueError(
+            f"All three periodicities are not within {leniency*100}% range. "
+            f"Since if we apply daily steps the last steps of two seasons differ by more then {leniency_seconds} seconds. "
+            f"Periodicity Train: {periodicity_seconds_train}, "
+            f"Periodicity Second: {periodicity_seconds_second}, "
+            f"Periodicity Predict: {periodicity_seconds_predict}."
+        )
+    if verbose:
+        logger.info(
+            f"  Train: {len(df_train)}, Second: {len(df_second)}, Predict: {len(df_predict)}"
+        )
+    if len(df_train) < 10 or len(df_second) < 10 or len(df_predict) < 10:
+        raise ValueError("Insufficient data in one of the segments for modeling.")
+    
+    return df_train, df_second, df_predict, seasonal_period_steps
 
 # ============================================================================
 # MAIN PROCESSING FUNCTION FOR ONE METER
@@ -439,6 +483,8 @@ def process_single_meter(
     device: Optional[torch.device] = None,
     verbose: bool = False,
     predictions_output_csv: Optional[str] = None,
+    weekly_seasonality: bool = True,
+    daily_steps: bool = True
 ) -> Dict:
     """
     Process a single water meter CSV file with UnobservedComponents
@@ -494,235 +540,126 @@ def process_single_meter(
             raise ValueError(
                 f"No 'hodnota' column found. Available: {df_raw.columns.tolist()}"
             )
+            
+        if len(df_raw) < 2:
+            raise ValueError("DataFrame passed is too short len < 2")
 
         df_raw["timestamp_utc"] = pd.to_datetime(df_raw["timestamp_utc"], utc=True)
         df_raw = df_raw[["timestamp_utc", "hodnota", "Diff"]].copy()
         df_raw.dropna(subset=["timestamp_utc"], inplace=True)
-
-        # ===== SPLIT INTO 3 CHUNKS (3–2m, 2–1m, 1m) =====
-        df_raw["timestamp_utc"] = pd.to_datetime(df_raw["timestamp_utc"], utc=True)
-        end = df_raw.loc[df_raw.index[-1], "timestamp_utc"]
-
-        start_pred = end - DateOffset(months=1)
-        start_second = start_pred - DateOffset(months=1)
-        start_train = start_second - DateOffset(months=1)
-
-        if start_train < df_raw.loc[0, "timestamp_utc"]:
-            raise ValueError(
-                f"Not enough data. Start time needed for train {start_train}, "
-                f"but earliest possible is {df_raw['timestamp_utc'].iloc[0]}"
-            )
-
-        mask = (df_raw["timestamp_utc"] >= start_pred) & (df_raw["timestamp_utc"] < end)
-        df_predict = df_raw.loc[mask].copy().reset_index(drop=True)
-        mask = (df_raw["timestamp_utc"] >= start_second) & (
-            df_raw["timestamp_utc"] < start_pred
-        )
-        df_second = df_raw.loc[mask].copy().reset_index(drop=True)
-        mask = (df_raw["timestamp_utc"] >= start_train) & (
-            df_raw["timestamp_utc"] < start_second
-        )
-        df_train = df_raw.loc[mask].copy().reset_index(drop=True)
-
-        result["train_samples"] = len(df_train)
-        result["second_train_samples"] = len(df_second)
-        result["predict_samples"] = len(df_predict)
+        
+        # ===== SPLIT INTO 3 CHUNKS =====
+        seed = int(result['filename'])
+        df_train, df_second, df_predict = split_df(df_raw=df_raw, seed=seed, result=result)
 
         # ===== RESAMPLE / FILL GAPS =====
-        df_train, diag_train = fill_gaps_with_periodicity_adaptive(
-            df_train, timestamp_col="timestamp_utc"
-        )
-        periodicity_seconds_train = diag_train["periodicity_used_seconds"]
+        df_train, df_second, df_predict, seasonal_period_steps = resample_dfs(df_train=df_train,
+                                                       df_second=df_second,
+                                                       df_predict=df_predict,
+                                                       result=result,
+                                                       verbose=verbose)
 
-        df_second, diag_second = fill_gaps_with_periodicity_adaptive(
-            df_second, timestamp_col="timestamp_utc"
-        )
-        periodicity_seconds_second = diag_second["periodicity_used_seconds"]
+        if seasonal_period_steps < 2:
+            raise ValueError(f'Number of steps in a season is smaller then 2.')
 
-        df_predict, diag_predict = fill_gaps_with_periodicity_adaptive(
-            df_predict, timestamp_col="timestamp_utc"
-        )
-        periodicity_seconds_predict = diag_predict["periodicity_used_seconds"]
-
-        result["train_samples_filled"] = len(df_train)
-        result["second_train_samples_filled"] = len(df_second)
-        result["predict_samples_filled"] = len(df_predict)
-
-        result["periodicity_seconds_train"] = periodicity_seconds_train
-        result["periodicity_seconds_second"] = periodicity_seconds_second
-        result["periodicity_seconds_predict"] = periodicity_seconds_predict
-
-        periods = [
-            periodicity_seconds_train,
-            periodicity_seconds_second,
-            periodicity_seconds_predict,
-        ]
-
-        p_min = min(periods)
-
-        if p_min == 0:
-            all_within_10pct = all(p == 0 for p in periods)
-        else:
-            all_within_10pct = all(abs(p - p_min) / p_min <= 0.10 for p in periods)
-
-        if not all_within_10pct:
-            raise ValueError(
-                f"All three periodicities are not within 10% range. "
-                f"Periodicity Train: {periodicity_seconds_train}, "
-                f"Periodicity Second: {periodicity_seconds_second}, "
-                f"Periodicity Predict: {periodicity_seconds_predict}."
-            )
-
-        if verbose:
-            logger.info(
-                f"  Train: {len(df_train)}, Second: {len(df_second)}, Predict: {len(df_predict)}"
-            )
-
-        if len(df_train) < 10 or len(df_second) < 10 or len(df_predict) < 10:
-            raise ValueError("Insufficient data in one of the segments for modeling.")
-
-        # Calculate seasonal period
-        seasonal_period_steps = calculate_seasonal_period(
-            periodicity_seconds_train, seasonal_cycle
-        )
         result["seasonal_period_steps"] = seasonal_period_steps
 
-        # ===================================================================
-        # INITIAL TRAINING (3–2 months ago)
-        # ===================================================================
-        y_train = df_train["Diff"].values.astype(float)
-
-        t_start_train = time.time()
-        try:
-            model_train = UnobservedComponents(
-                endog=y_train,
-                level="local level",  # local level only, no slope
-                seasonal=seasonal_period_steps,
-                stochastic_level=True,
-                stochastic_seasonal=True,
-            )
-            res_train = model_train.fit(disp=False)
-        except Exception as e:
-            raise ValueError(f"Failed to fit initial training model: {e}")
-        
-        result["converged_train"] = res_train.mle_retvals['converged']
-
-        if not res_train.mle_retvals['converged']:
-            logger.info(f"Did not converge because of {res_train.mle_retvals['warnflag']} at value {res_train.mle_retvals['gopt']}")
-            result['warnflag_train'] = res_train.mle_retvals['warnflag']
-            result["gopt_train"] = res_train.mle_retvals['gopt']
-        else:
-            result['warnflag_train'] = ''
-            result["gopt_train"] = ''
+        if weekly_seasonality:
+            weekly_period_steps = 7 * seasonal_period_steps
+            freq_seasonal = [
+                {
+                    "period": weekly_period_steps,
+                    "harmonics": 2,
+                },
+            ]
+            stochastic_freq_seasonal = [True]
             
-        t_end_train = time.time()
-        result["train_time_seconds"] = t_end_train - t_start_train
-
-        # Get filtered states at end of training segment
-        filtered_state = res_train.filter_results.filtered_state
-        filtered_cov = res_train.filter_results.filtered_state_cov
-
-        last_state_mean = filtered_state[:, -1].copy()
-        last_state_cov = filtered_cov[:, :, -1].copy()
-
-        theta_train = res_train.params
-        result["train_loglike"] = res_train.llf
-
-        # ===================================================================
-        # SECOND TRAINING (2–1 months ago) with fixed initial state
-        # ===================================================================
-        y_second = df_second["Diff"].values.astype(float)
-
-        t_start_second = time.time()
-        try:
-            model_second = UnobservedComponents(
-                endog=y_second,
-                level="local level",
-                seasonal=seasonal_period_steps,
-                stochastic_level=True,
-                stochastic_seasonal=True,
-            )
-
-            # Initialize from last state of training segment
-            if periodicity_seconds_second == periodicity_seconds_train:
-                model_second.initialize_known(
-                    initial_state=last_state_mean, initial_state_cov=last_state_cov
-                )
-
-            res_second = model_second.fit(disp=False)
-        except Exception as e:
-            raise ValueError(f"Failed to fit second training model: {e}")
-        
-        result["converged_second"] = res_second.mle_retvals['converged']
-        
-        if not res_second.mle_retvals['converged']:
-            logger.info(f"Did not converge because of {res_second.mle_retvals['warnflag']} at value {res_second.mle_retvals['gopt']}")
-            result['warnflag_second'] = res_second.mle_retvals['warnflag']
-            result["gopt_second"] = res_second.mle_retvals['gopt']
+            if not daily_steps:
+                freq_seasonal.append({
+                    "period": seasonal_period_steps,
+                    "harmonics": 2,
+                })
+                stochastic_freq_seasonal.append(True)
+                seasonal_period_steps = None
         else:
-            result['warnflag_second'] = ''
-            result["gopt_second"] = ''
+            freq_seasonal = None
+            stochastic_freq_seasonal = None
+        # ===================================================================
+        # INITIAL TRAINING
+        # ===================================================================
+        
+        #If meter runs potentially too long do not run the model
+        can_long_run_length(train_samples=result['train_samples'],
+                            train_samples_filled=result['train_samples_filled'],
+                            periodicity_seconds=result['periodicity_seconds_train'])
 
-        t_end_second = time.time()
-        result["second_train_time_seconds"] = t_end_second - t_start_second
-
-        filtered_state_2 = res_second.filter_results.filtered_state
-        filtered_cov_2 = res_second.filter_results.filtered_state_cov
-
-        last_state_mean_2 = filtered_state_2[:, -1].copy()
-        last_state_cov_2 = filtered_cov_2[:, :, -1].copy()
-
-        theta_second = res_second.params
-        result["second_train_loglike"] = res_second.llf
+        last_state_mean, last_state_cov, _ = train_model(df_train=df_train,
+                                                         seasonal_period_steps=seasonal_period_steps,
+                                                         result=result,
+                                                         initial_train=True,
+                                                         freq_seasonal=freq_seasonal,
+                                                         stochastic_freq_seasonal=stochastic_freq_seasonal,
+                                                         daily_steps=daily_steps)
+        
+        # ===================================================================
+        # SECOND TRAINING
+        # ===================================================================
+        
+        #If meter runs potentially too long do not run the model
+        can_long_run_length(train_samples=result['second_train_samples'],
+                            train_samples_filled=result['second_train_samples_filled'],
+                            periodicity_seconds=result['periodicity_seconds_second'])
+        
+        init_second_mean = None
+        init_second_cov = None
+        if result['periodicity_seconds_train'] == result['periodicity_seconds_second']:
+            init_second_mean = last_state_mean
+            init_second_cov = last_state_cov
+        
+        last_state_mean_2, last_state_cov_2, theta_second = train_model(df_train=df_second,
+                                                                        seasonal_period_steps=seasonal_period_steps,
+                                                                        result=result,
+                                                                        initial_train=False,
+                                                                        init_state_mean=init_second_mean,
+                                                                        init_state_cov=init_second_cov,
+                                                                        freq_seasonal=freq_seasonal,
+                                                                        stochastic_freq_seasonal=stochastic_freq_seasonal,
+                                                                        daily_steps=daily_steps)
 
         # ===================================================================
-        # PREDICTION (last month) starting from last state of second segment
+        # PREDICTION 
         # ===================================================================
-        y_pred_segment = df_predict["Diff"].values.astype(float)
-
-        t_start_pred = time.time()
-        try:
-            model_pred = UnobservedComponents(
-                endog=y_pred_segment,
-                level="local level",
-                seasonal=seasonal_period_steps,
-                stochastic_level=True,
-                stochastic_seasonal=True,
-            )
-
-            # Initialize from last state of second training segment
-            if periodicity_seconds_predict == periodicity_seconds_second:
-                model_pred.initialize_known(
-                    initial_state=last_state_mean_2, initial_state_cov=last_state_cov_2
-                )
-
-            # Filter with parameters from second training
-            res_pred = model_pred.filter(theta_second)
-
-            # Get one-step-ahead predictions
-            pred_obj = res_pred.get_prediction()
-            pred_mean = pred_obj.predicted_mean
-            pred_mean = np.asarray(pred_mean, dtype=float)
-            pred_mean = np.clip(pred_mean, 0.0, None)
-        except Exception as e:
-            raise ValueError(f"Failed to generate predictions: {e}")
-
-        t_end_pred = time.time()
-        result["prediction_time_seconds"] = t_end_pred - t_start_pred
-
+        init_predict_mean = None
+        init_predict_cov = None
+        if result['periodicity_seconds_second'] == result['periodicity_seconds_predict']:
+            init_predict_mean = last_state_mean_2
+            init_predict_cov = last_state_cov_2
+            
+        
+        predictions_mean = predict_model(df_predict=df_predict,
+                                        seasonal_period_steps=seasonal_period_steps,
+                                        result=result,
+                                        init_state_mean=init_predict_mean,
+                                        init_state_cov=init_predict_cov,
+                                        theta=theta_second,
+                                        freq_seasonal=freq_seasonal,
+                                        )
+        
+        
+        actuals = df_predict["Diff"].values.astype(float)
         timestamps_pred = df_predict["timestamp_utc"].values
-        actuals = y_pred_segment
-        predictions_used = pred_mean
 
         # Build results dataframe (keeps NaN values)
-        predictions_df = build_results_df(timestamps_pred, actuals, predictions_used)
+        predictions_df = build_results_df(timestamps_pred, actuals, predictions_mean)
 
         if predictions_output_csv is not None:
             predictions_df.to_csv(predictions_output_csv, index=False)
 
-        # ===== METRICS (handles NaN properly) =====
+        # ===================================================================
+        # METRICS 
+        # ===================================================================
         residuals = predictions_df["residual"].values
-        metrics = calculate_metrics(actuals, predictions_used, residuals)
+        metrics = calculate_metrics(actuals, predictions_mean, residuals)
 
         for key, value in metrics.items():
             result[f"metric_{key}"] = value
@@ -759,9 +696,11 @@ def process_batch(
     seasonal_cycle: str = "daily",
     num_workers: int = 4,
     verbose: bool = False,
+    per_file_timeout: int = 600,  # seconds; tune as needed (e.g. 300, 900)
 ):
     """
     Process multiple water meter CSV files in parallel with UnobservedComponents.
+    Uses ProcessPoolExecutor so that hung meters can be truly killed via timeout.
 
     Parameters:
     -----------
@@ -783,10 +722,11 @@ def process_batch(
             f"Processing {len(csv_filepaths)} files with {num_workers} workers"
         )
         logger.info(f"Seasonal cycle: {seasonal_cycle}")
+        logger.info(f"Per-file timeout: {per_file_timeout} seconds")
 
     all_results = []
 
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = {}
 
         for filepath in csv_filepaths:
@@ -796,7 +736,7 @@ def process_batch(
                 process_single_meter,
                 filepath,
                 seasonal_cycle=seasonal_cycle,
-                device=device,
+                device=None,
                 verbose=verbose,
             )
             futures[future] = filename
@@ -807,10 +747,24 @@ def process_batch(
         ):
             filename = futures[future]
             try:
-                result = future.result()
+                result = future.result(timeout=per_file_timeout)
                 all_results.append(result)
                 if verbose:
                     logger.info(f"[{i}/{len(futures)}] Completed {filename}")
+                    
+            except TimeoutError:
+                logger.error(
+                    f"[{i}/{len(futures)}] Timeout when processing {filename} "
+                    f"(>{per_file_timeout}s). Marking as failed and cancelling."
+                )
+                future.cancel()
+                all_results.append(
+                    {
+                        "filename": filename,
+                        "status": "failed",
+                        "error": f"Timeout after {per_file_timeout}s",
+                    }
+                )
             except Exception as e:
                 logger.error(f"[{i}/{len(futures)}] Failed to process {filename}: {e}")
                 all_results.append(
@@ -910,8 +864,8 @@ def main():
     csv_filepaths = random.sample(all_files, min(args.samples, len(all_files)))
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    output_csv = f"./results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped.csv"
-
+    output_csv = f"./results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_600_reworked_weekly_fourier_2_daily_fourier_2_no_seasonal.csv"
+    #output_csv = './test'
     _ = process_batch(
         csv_filepaths,
         output_csv,

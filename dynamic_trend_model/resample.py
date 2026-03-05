@@ -18,7 +18,7 @@ def get_periodicity(df: pd.DataFrame, timestamp_col: str = 'timestamp_utc') -> i
     time_diffs = df[timestamp_col].diff().dropna().dt.total_seconds()
     
     if time_diffs.empty:
-        raise ValueError("No time difference calculated.")
+        raise ValueError("No time difference calculated. No two valid neighboring values found.")
 
     common_periodicity_mode= time_diffs.mode()
     #print(f"Periodicity found {common_periodicity_mode.iloc[0]/60} minutes.")
@@ -116,7 +116,7 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
                 min_positive = sorted_diffs.iloc[idx_sorted_diffs]
             
             next_real_index = time_diffs_real[time_diffs_real == min_positive].index[0]
-            nans_needed = round(sorted_diffs.iloc[0] / periodicity_seconds)
+            nans_needed = round(sorted_diffs.iloc[idx_sorted_diffs] / periodicity_seconds)
             
             if not_enough_data:
                 break
@@ -169,49 +169,65 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
     unmatched_indices = [idx for idx in df.index if idx not in matched_indices]
     
     # Build detailed unmatched readings list
-    for idx in unmatched_indices:
-        row = df.loc[idx]
-        
-        # Find what the expected slot would have been (closest in our result)
-        if len(filled_df) > 0:
-            time_diffs_to_result = abs((filled_df[timestamp_col] - row[timestamp_col]).dt.total_seconds())
-            nearest_result_idx = time_diffs_to_result.argmin()
-            expected_slot = filled_df.loc[nearest_result_idx, timestamp_col]
-            time_diff = time_diffs_to_result.iloc[nearest_result_idx]
-        else:
-            expected_slot = None
-            time_diff = None
-        
-        # Get previous and next readings in the original data
-        prev_idx = idx - 1 if idx > 0 else None
-        next_idx = idx + 1 if idx < len(df) - 1 else None
-        
-        prev_row = df.loc[prev_idx] if prev_idx is not None else None
-        next_row = df.loc[next_idx] if next_idx is not None else None
-        
-        unmatched_detail.append({
-            'reading_timestamp': str(row[timestamp_col]),
-            'hodnota': float(row['hodnota']) if pd.notna(row['hodnota']) else None,
-            'expected_slot': str(expected_slot) if expected_slot else None,
-            'time_difference_seconds': float(time_diff) if time_diff is not None else None,
-            'prev_reading_timestamp': str(prev_row[timestamp_col]) if prev_row is not None else None,
-            'prev_reading_value': float(prev_row['hodnota']) if prev_row is not None and pd.notna(prev_row['hodnota']) else None,
-            'next_reading_timestamp': str(next_row[timestamp_col]) if next_row is not None else None,
-            'next_reading_value': float(next_row['hodnota']) if next_row is not None and pd.notna(next_row['hodnota']) else None
-        })
-        
+    try:
+        for idx in unmatched_indices:
+            row = df.loc[idx]
+
+            # Find what the expected slot would have been (closest in our result)
+            if len(filled_df) > 0:
+                time_diffs_to_result = abs((filled_df[timestamp_col] - row[timestamp_col]).dt.total_seconds())
+                nearest_result_idx = time_diffs_to_result.argmin()
+                expected_slot = filled_df.loc[nearest_result_idx, timestamp_col]
+                time_diff = time_diffs_to_result.iloc[nearest_result_idx]
+            else:
+                expected_slot = None
+                time_diff = None
+
+            # Get previous and next readings in the original data
+            prev_idx = idx - 1 if idx > 0 else None
+            next_idx = idx + 1 if idx < len(df) - 1 else None
+
+            prev_row = df.loc[prev_idx] if prev_idx is not None else None
+            next_row = df.loc[next_idx] if next_idx is not None else None
+
+            unmatched_detail.append({
+                'reading_timestamp': str(row[timestamp_col]),
+                'hodnota': float(row['hodnota']) if pd.notna(row['hodnota']) else None,
+                'expected_slot': str(expected_slot) if expected_slot else None,
+                'time_difference_seconds': float(time_diff) if time_diff is not None else None,
+                'prev_reading_timestamp': str(prev_row[timestamp_col]) if prev_row is not None else None,
+                'prev_reading_value': float(prev_row['hodnota']) if prev_row is not None and pd.notna(prev_row['hodnota']) else None,
+                'next_reading_timestamp': str(next_row[timestamp_col]) if next_row is not None else None,
+                'next_reading_value': float(next_row['hodnota']) if next_row is not None and pd.notna(next_row['hodnota']) else None
+            })
+    except Exception as e:
+        print("Didnt manage to build unmatched reading list.")
+
     filled_diffs = filled_df[timestamp_col].diff()
     min_allowed_diff = pd.Timedelta(seconds=periodicity_seconds*0.5)
     max_allowed_diff = pd.Timedelta(seconds=periodicity_seconds*1.5)
     if ((min_allowed_diff > filled_diffs) | (filled_diffs > max_allowed_diff)).any():
-        raise ValueError("Some timestamp differences in the new resampled df are larger or smaller then allowed.")
-        #for idx, diff in enumerate(filled_diffs):
-        #    if min_allowed_diff > diff:
-        #        print(f"Diff is smaller then possible on idx: {idx} which is datetime {filled_df[timestamp_col].loc[idx]}")
-        #    elif diff > max_allowed_diff:
-        #        print(f"Diff is larger then possible on idx: {idx} which is datetime {filled_df[timestamp_col].loc[idx]}")
+        #raise ValueError("Some timestamp differences in the new resampled df are larger or smaller then allowed.")
+        for idx, diff in enumerate(filled_diffs):
+            if min_allowed_diff > diff:
+                print(f"Periodicity used: {periodicity_seconds}")
+                print(f"Diff is smaller then possible on idx: {idx} which is datetime {filled_df[timestamp_col].loc[idx]}")
+            elif diff > max_allowed_diff:
+                print(f"Periodicity used: {periodicity_seconds}")
+                print(f"Diff is larger then possible on idx: {idx} which is datetime {filled_df[timestamp_col].loc[idx]}")
+        
+    #diff_vals = []
+    #old_hodnota = np.nan
+    #for hodnota in filled_df['hodnota']:
+    #    if pd.isna(hodnota):
+    #        diff_vals.append(np.nan)
+    #        continue
+    #    diff_vals.append(hodnota - old_hodnota)
+    #    old_hodnota = hodnota
+    #    
+    #filled_df['Diff'] = diff_vals
     
-     # Add Diff (diff needs to be recalculated so when there is a gap there is no diff after a gap)
+    # Add Diff (diff needs to be recalculated so when there is a gap there is no diff after a gap)
     filled_df['Diff'] = filled_df['hodnota'].diff()
     # This is for metadata_001 (we allow 0.001 negative difference and set it to 0)
     # Set Diff to np.nan where it is smaller than -0.001
