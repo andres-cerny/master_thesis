@@ -399,140 +399,166 @@ def predict_model(df_predict, seasonal_period_steps, result, init_state_mean, in
 
     return pred_mean
 
-def split_df(df_raw, seed, result, test_window_days=100, min_periodicity_month_train=20):
-    '''
-    Split df into 3 chunks for pre-training, training and prediction
-    '''
-    df_raw["timestamp_utc"] = pd.to_datetime(df_raw["timestamp_utc"], utc=True)
-    
-    min_ts = df_raw["timestamp_utc"].min()
-    max_ts = df_raw["timestamp_utc"].max()
+def split_df_sliding_weeks(
+    df_raw,
+    seed,
+    result,
+    total_weeks=6,
+    min_days_per_week=7,
+    min_days_with_data_per_day=1,
+    min_periodicity_month_train=20
+):
+    """
+    Split df into 3 overlapping chunks on a random 6-week window:
+    - Weeks 1–4: initial training
+    - Weeks 2–5: second training
+    - Week 6: prediction (and anomaly injection)
 
-    span = max_ts - min_ts
-    if span < pd.Timedelta(days=test_window_days):
+    Constraints:
+    - The chosen 6-week window must have at least one measurement per day.
+    """
+
+    df = df_raw.copy()
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+    df = df.sort_values("timestamp_utc").reset_index(drop=True)
+
+    min_ts = df["timestamp_utc"].min()
+    max_ts = df["timestamp_utc"].max()
+
+    total_days_required = 7 * total_weeks
+    if max_ts - min_ts < pd.Timedelta(days=total_days_required):
         raise ValueError(
-            f"Not enough data. Do not have at least {test_window_days} days of data."
+            f"Not enough data. Need at least {total_days_required} days "
+            f"of data to form a {total_weeks}-week window."
         )
-        
-    min_window = pd.Timedelta(days=test_window_days)
-    latest_start = max_ts - min_window
-    
-    # single random draw between min_ts and latest_start for this meter (reproducible for this seed)
-    rng = default_rng(seed)
-    u = rng.random()
-    
-    rand_start = min_ts + (latest_start - min_ts) * u
-    rand_start = pd.to_datetime(rand_start)
-    rand_end = rand_start + min_window
 
-    df_3m = df_raw[(df_raw["timestamp_utc"] >= rand_start) &
-                   (df_raw["timestamp_utc"] < rand_end)].copy().reset_index(drop=True)
+    # Pre-compute per-day counts to help check gaps quickly
+    df["date"] = df["timestamp_utc"].dt.floor("D")
+    daily_counts = df.groupby("date").size().rename("count").reset_index()
+
+    # Helper to check if a [start, end) window has at least one measurement per day
+    def window_has_no_big_gaps(start_ts, end_ts):
+        window_days = pd.date_range(
+            start=start_ts.floor("D"),
+            end=(end_ts - pd.Timedelta(seconds=1)).floor("D"),
+            freq="D",
+        )
+        df_counts_window = daily_counts[
+            (daily_counts["date"] >= window_days.min())
+            & (daily_counts["date"] <= window_days.max())
+        ]
+
+        # Merge to ensure all days are present (including those with 0 counts)
+        df_counts_full = (
+            pd.DataFrame({"date": window_days})
+            .merge(df_counts_window, on="date", how="left")
+            .fillna({"count": 0})
+        )
+
+        # Condition: each day must have at least one measurement
+        return (df_counts_full["count"] >= min_days_with_data_per_day).all()
+
+    # Randomly choose a 6-week window that satisfies the "no big gaps" condition
+    rng = default_rng(seed)
+
+    max_start = max_ts - pd.Timedelta(days=total_days_required)
+    # We attempt several random draws; if none succeed, we fail
+    max_tries = 30
+    chosen_start = None
+
+    for _ in range(max_tries):
+        u = rng.random()
+        rand_start = min_ts + (max_start - min_ts) * u
+        rand_start = pd.to_datetime(rand_start)
+        # Align to midnight for clearer week boundaries
+        rand_start = rand_start.floor("D")
+
+        rand_end = rand_start + pd.Timedelta(days=total_days_required)
+
+        # Check window fits into data span
+        if rand_end > max_ts:
+            continue
+
+        if window_has_no_big_gaps(rand_start, rand_end):
+            chosen_start = rand_start
+            break
+
+    if chosen_start is None:
+        raise ValueError(
+            f"Could not find a {total_weeks}-week window with at least one "
+            f"measurement per day after {max_tries} tries."
+        )
+
+    chosen_end = chosen_start + pd.Timedelta(days=total_days_required)
+
+    df_6w = df[
+        (df["timestamp_utc"] >= chosen_start)
+        & (df["timestamp_utc"] < chosen_end)
+    ].copy().reset_index(drop=True)
     
-    periodicity_sec_df_3m = get_periodicity(df_3m)
+    df_predict_unresampled = df_6w[
+        (df_6w["timestamp_utc"] >= (chosen_end - pd.Timedelta(weeks=1)))
+        & (df_6w["timestamp_utc"] < chosen_end)
+    ].copy().reset_index(drop=True)
     
-    window_days = 30
-    if periodicity_sec_df_3m < min_periodicity_month_train * 60:
-        window_days = 14
-        
-    result['train_predict_window_days'] = window_days
+    # Get periodicity
+    df_6w, diag = fill_gaps_with_periodicity_adaptive(
+        df_6w, timestamp_col="timestamp_utc")
     
-    end = df_3m.loc[df_3m.index[-1], "timestamp_utc"]
-    start_pred = end - DateOffset(days=window_days)
-    start_second = start_pred - DateOffset(days=window_days)
-    start_train = start_second - DateOffset(days=window_days)
+    periodicity_seconds = diag["periodicity_used_seconds"]
+    result["df_samples_filled"] = len(df_6w)
+    result["periodicity_seconds"] = periodicity_seconds
+
+    if periodicity_seconds == 0:
+        raise ValueError("Periodicitu is equal to 0")
     
-    #if 3*window_size did not fit into df_3m choose the last 3 window_size from df_raw
-    if start_train < df_3m.loc[0, "timestamp_utc"]:
-        end = df_raw.loc[df_raw.index[-1], "timestamp_utc"]
-        start_pred = end - DateOffset(days=window_days)
-        start_second = start_pred - DateOffset(days=window_days)
-        start_train = start_second - DateOffset(days=window_days)
+    seasonal_period_steps = calculate_seasonal_period(periodicity_seconds)
+    result["seasonal_period_steps"] = seasonal_period_steps
     
-        if start_train < df_raw.loc[0, "timestamp_utc"]:
-            raise ValueError(
-                f"Not enough data. Start time needed for train {start_train}, "
-                f"but earliest possible is {df_3m['timestamp_utc'].iloc[0]}"
-            )
-        
-    mask = (df_3m["timestamp_utc"] >= start_pred) & (df_3m["timestamp_utc"] < end)
-    df_predict = df_3m.loc[mask].copy().reset_index(drop=True)
+    weeks_train = 4
+    if periodicity_seconds < min_periodicity_month_train * 60:
+        weeks_train = 2
+
+    # Week for prediction
+    start_pred = chosen_end - pd.Timedelta(weeks=1)
+    end_pred = chosen_end
     
-    mask = (df_3m["timestamp_utc"] >= start_second) & (
-        df_3m["timestamp_utc"] < start_pred
-    )
-    df_second = df_3m.loc[mask].copy().reset_index(drop=True)
+    # Weeks for second training
+    start_second = start_pred - pd.Timedelta(weeks=weeks_train)
+    end_second = start_pred
     
-    mask = (df_3m["timestamp_utc"] >= start_train) & (
-        df_3m["timestamp_utc"] < start_second
-    )
-    df_train = df_3m.loc[mask].copy().reset_index(drop=True)
-    
+    # Weeks for initial training
+    start_train = start_second - pd.Timedelta(weeks=weeks_train)
+    end_train = start_second
+
+    # Slice dataframes
+    df_train = df_6w[
+        (df_6w["timestamp_utc"] >= start_train)
+        & (df_6w["timestamp_utc"] < end_train)
+    ].copy().reset_index(drop=True)
+
+    df_second = df_6w[
+        (df_6w["timestamp_utc"] >= start_second)
+        & (df_6w["timestamp_utc"] < end_second)
+    ].copy().reset_index(drop=True)
+
+    df_predict = df_6w[
+        (df_6w["timestamp_utc"] >= start_pred)
+        & (df_6w["timestamp_utc"] < end_pred)
+    ].copy().reset_index(drop=True)
+
     result["train_samples"] = len(df_train)
     result["second_train_samples"] = len(df_second)
     result["predict_samples"] = len(df_predict)
-    
-    return df_train, df_second, df_predict
+    result["train_predict_window_days"] = total_days_required
 
-def resample_dfs(df_train, df_second, df_predict, result, verbose, leniency = 0.333):
-    '''
-    leniency = max percentage time difference (in terms of percentage of a period) between last two steps in dfs with different periods
-    '''
-    
-    df_predict_unresampled = df_predict.copy()
-    
-    # ===== RESAMPLE / FILL GAPS =====
-    df_train, diag_train = fill_gaps_with_periodicity_adaptive(
-        df_train, timestamp_col="timestamp_utc"
-    )
-    periodicity_seconds_train = diag_train["periodicity_used_seconds"]
-    df_second, diag_second = fill_gaps_with_periodicity_adaptive(
-        df_second, timestamp_col="timestamp_utc"
-    )
-    periodicity_seconds_second = diag_second["periodicity_used_seconds"]
-    df_predict, diag_predict = fill_gaps_with_periodicity_adaptive(
-        df_predict, timestamp_col="timestamp_utc"
-    )
-    periodicity_seconds_predict = diag_predict["periodicity_used_seconds"]
-    result["train_samples_filled"] = len(df_train)
-    result["second_train_samples_filled"] = len(df_second)
-    result["predict_samples_filled"] = len(df_predict)
-    result["periodicity_seconds_train"] = periodicity_seconds_train
-    result["periodicity_seconds_second"] = periodicity_seconds_second
-    result["periodicity_seconds_predict"] = periodicity_seconds_predict
-    periods = [
-        periodicity_seconds_train,
-        periodicity_seconds_second,
-        periodicity_seconds_predict,
-    ]
-    p_min = min(periods)
-    if p_min == 0:
+    if len(df_train) < 2 or len(df_second) < 2 or len(df_predict) < 2:
         raise ValueError(
-                        "One of periodicities is equal to 0"
-                        f"Periodicity Train: {periodicity_seconds_train}, "
-                        f"Periodicity Second: {periodicity_seconds_second}, "
-                        f"Periodicity Predict: {periodicity_seconds_predict}."
-                        )
-    
-    leniency_seconds = p_min * leniency
-    seasonal_period_steps = calculate_seasonal_period(p_min)
-    
-    all_within_pct = all(abs(p*seasonal_period_steps - p_min*seasonal_period_steps) <= leniency_seconds for p in periods)
-    if not all_within_pct:
-        raise ValueError(
-            f"All three periodicities are not within {leniency*100}% range. "
-            f"Since if we apply daily steps the last steps of two seasons differ by more then {leniency_seconds} seconds. "
-            f"Periodicity Train: {periodicity_seconds_train}, "
-            f"Periodicity Second: {periodicity_seconds_second}, "
-            f"Periodicity Predict: {periodicity_seconds_predict}."
+            "Insufficient data in one of the 6-week subsegments "
+            "(train/second/predict) for modeling."
         )
-    if verbose:
-        logger.info(
-            f"  Train: {len(df_train)}, Second: {len(df_second)}, Predict: {len(df_predict)}"
-        )
-    if len(df_train) < 10 or len(df_second) < 10 or len(df_predict) < 10:
-        raise ValueError("Insufficient data in one of the segments for modeling.")
-    
-    return df_train, df_second, df_predict, seasonal_period_steps, df_predict_unresampled
+
+    return df_train, df_second, df_predict, df_predict_unresampled
 
 # ============================================================================
 # MAIN PROCESSING FUNCTION FOR ONE METER
@@ -554,10 +580,11 @@ def process_single_meter(
     Process a single water meter CSV file with UnobservedComponents
     (local level + seasonal model, no slope).
 
-    Splitting logic (in terms of number of readings):
-    - 3–2 months ago: initial training
-    - 2–1 months ago: second training (initialized from previous state)
-    - last month: prediction (initialized from previous state)
+    Splitting logic (time-based, sliding window):
+    - Choose a random 6-week window with at least one measurement per day.
+    - Weeks 1–4 of that window: initial training.
+    - Weeks 2–5 of that window: second training (initialized from previous state).
+    - Week 6 of that window: prediction (initialized from previous state, anomalies injected only here).
 
     Parameters:
     -----------
@@ -609,16 +636,12 @@ def process_single_meter(
         df_raw = df_raw.copy()
         df_raw.dropna(subset=["timestamp_utc"], inplace=True)
         
-        # ===== SPLIT INTO 3 CHUNKS =====
+        # ===================================================================
+        # RESAMPLE and SPLIT into 3 CHUNKS
+        # ===================================================================
         seed = int(result['filename'])
-        df_train, df_second, df_predict = split_df(df_raw=df_raw, seed=seed, result=result)
-
-        # ===== RESAMPLE / FILL GAPS =====
-        df_train, df_second, df_predict, seasonal_period_steps, df_predict_unresampled = resample_dfs(df_train=df_train,
-                                                       df_second=df_second,
-                                                       df_predict=df_predict,
-                                                       result=result,
-                                                       verbose=verbose)
+        df_train, df_second, df_predict, df_predict_unresampled = split_df_sliding_weeks(df_raw=df_raw, seed=seed, result=result)
+        seasonal_period_steps = result["seasonal_period_steps"]
 
         if seasonal_period_steps < 2:
             raise ValueError(f'Number of steps in a season is smaller then 2.')
@@ -645,15 +668,10 @@ def process_single_meter(
         else:
             freq_seasonal = None
             stochastic_freq_seasonal = None
+            
         # ===================================================================
         # INITIAL TRAINING
         # ===================================================================
-        
-        #If meter runs potentially too long do not run the model
-        #can_long_run_length(train_samples=result['train_samples'],
-        #                    train_samples_filled=result['train_samples_filled'],
-        #                    periodicity_seconds=result['periodicity_seconds_train'])
-        
         last_state_mean, last_state_cov, _ = train_model(df_train=df_train,
                                                          seasonal_period_steps=seasonal_period_steps,
                                                          result=result,
@@ -665,17 +683,8 @@ def process_single_meter(
         # ===================================================================
         # SECOND TRAINING
         # ===================================================================
-        
-        #If meter runs potentially too long do not run the model
-        #can_long_run_length(train_samples=result['second_train_samples'],
-        #                    train_samples_filled=result['second_train_samples_filled'],
-        #                    periodicity_seconds=result['periodicity_seconds_second'])
-        
-        init_second_mean = None
-        init_second_cov = None
-        if result['periodicity_seconds_train'] == result['periodicity_seconds_second']:
-            init_second_mean = last_state_mean
-            init_second_cov = last_state_cov
+        init_second_mean = last_state_mean
+        init_second_cov = last_state_cov
         
         last_state_mean_2, last_state_cov_2, theta_second = train_model(df_train=df_second,
                                                                         seasonal_period_steps=seasonal_period_steps,
@@ -694,13 +703,9 @@ def process_single_meter(
         # ===================================================================
         # PREDICTION 
         # ===================================================================
-        init_predict_mean = None
-        init_predict_cov = None
-        if result['periodicity_seconds_second'] == result['periodicity_seconds_predict']:
-            init_predict_mean = last_state_mean_2
-            init_predict_cov = last_state_cov_2
+        init_predict_mean = last_state_mean_2
+        init_predict_cov = last_state_cov_2
             
-        
         predictions_mean = predict_model(df_predict=df_predict,
                                         seasonal_period_steps=seasonal_period_steps,
                                         result=result,
@@ -759,7 +764,7 @@ def process_batch(
     seasonal_cycle: str = "daily",
     num_workers: int = 4,
     verbose: bool = False,
-    per_file_timeout: int = 600,  # seconds; tune as needed (e.g. 300, 900)
+    per_file_timeout: int = 300,  # seconds; tune as needed (e.g. 300, 900)
 ):
     """
     Process multiple water meter CSV files in parallel with UnobservedComponents.
@@ -934,7 +939,7 @@ def main():
     #]
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    output_csv = f"./results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_600_reworked.csv"
+    output_csv = f"./6_weeks_results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_600_reworked.csv"
     
     _ = process_batch(
         csv_filepaths,

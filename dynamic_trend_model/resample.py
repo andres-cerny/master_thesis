@@ -26,86 +26,85 @@ def get_periodicity(df: pd.DataFrame, timestamp_col: str = 'timestamp_utc') -> i
     
 
 
-def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc', tolerance_percentage=10):
+def fill_gaps_with_periodicity_adaptive(
+    df,
+    timestamp_col: str = 'timestamp_utc',
+    tolerance_percentage=10
+):
     """
     Fill gaps in time-series data for a single id sensor using adaptive timestamp generation.
     Instead of creating a full expected range upfront, this function builds the expected timeline
     iteratively based on actual readings, adjusting for timing drift.
-    
-    Parameters:
-    -----------
+
+    Parameters
+    ----------
     df : pandas.DataFrame
         DataFrame with columns: 'timestamp_utc', 'hodnota', 'Diff'
         Must contain data for a single sensor only.
+        Optionally may contain 'is_anomaly' (float or int).
     tolerance_percentage : float
         Tolerance as percentage of periodicity (e.g., 10 means 10% of periodicity_seconds)
-        
-    Returns:
-    --------
+
+    Returns
+    -------
     pandas.DataFrame
-        DataFrame with filled gaps (NaN for missing values)
+        DataFrame with filled gaps (NaN for missing hodnota, is_anomaly = 0 for synthetic rows)
     dict
-        Dictionary with diagnostic information including detailed unmatched readings
+        Diagnostics
     """
-    # Make a copy to avoid modifying original
     df = df.copy()
-    
+
     if len(df) < 2:
-        raise ValueError("DataFrame passed is too short len < 2")
-    
+        raise ValueError("DataFrame passed is too short len < 2 in resample script")
+
     if timestamp_col not in df.columns:
-            raise ValueError(
-                f"No {timestamp_col} column found. Available: {df.columns.tolist()}"
-            )
-            
+        raise ValueError(
+            f"No {timestamp_col} column found. Available: {df.columns.tolist()}"
+        )
+
     if 'hodnota' not in df.columns:
-            raise ValueError(
-                f"No 'hodnota' column found. Available: {df.columns.tolist()}"
-            )
-    
+        raise ValueError(
+            f"No 'hodnota' column found. Available: {df.columns.tolist()}"
+        )
+
+    # Ensure is_anomaly exists; if not, create it as 0
+    if 'is_anomaly' not in df.columns:
+        df['is_anomaly'] = 0.0
+
     try:
         periodicity_seconds = get_periodicity(df, timestamp_col=timestamp_col)
     except ValueError as e:
         print(f"Couldn't find periodicity, skipping this df and getting an error: {e}")
         return df, {}
-    
-    # Calculate tolerance in seconds based on percentage
+
     tolerance_seconds = (tolerance_percentage / 100.0) * periodicity_seconds
-    
-    # Initialize variables for adaptive timeline building
+
     result_rows = []
     unmatched_detail = []
     matched_indices = set()
-    
-    # Start with the first timestamp
+
     actual_reading_time = df.loc[0, timestamp_col]
-    
-    # Track the original data end time
     data_end_time = df[timestamp_col].max()
-    
+
     def get_candidate_indeces(df, within_tolerance, matched_indices):
         if not within_tolerance.any():
             return []
-        # Get indices of all readings within tolerance
         candidate_indices = df.index[within_tolerance].tolist()
-        # Remove already matched indices
         candidate_indices = [idx for idx in candidate_indices if idx not in matched_indices]
         return candidate_indices
-    
+
     while (actual_reading_time + pd.Timedelta(seconds=periodicity_seconds)) <= data_end_time:
-        # Calculate next expected timestamp from the ACTUAL reading
         expected_next = actual_reading_time + pd.Timedelta(seconds=periodicity_seconds)
-        # Find readings within tolerance of expected_next
         time_diffs = abs((df[timestamp_col] - expected_next).dt.total_seconds())
         within_tolerance = time_diffs <= tolerance_seconds
         candidate_indices = get_candidate_indeces(df, within_tolerance, matched_indices)
-        
+
         if not candidate_indices:
             time_diffs_real = (df[timestamp_col] - actual_reading_time).dt.total_seconds()
             sorted_diffs = time_diffs_real[time_diffs_real > 0].sort_values()
             min_positive = sorted_diffs.iloc[0]
-            
-            min_allowed_diff = periodicity_seconds*0.5
+
+            min_allowed_diff = periodicity_seconds * 0.5
             idx_sorted_diffs = 0
             not_enough_data = False
             while min_positive < min_allowed_diff:
@@ -114,68 +113,68 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
                     not_enough_data = True
                     break
                 min_positive = sorted_diffs.iloc[idx_sorted_diffs]
-            
+
             next_real_index = time_diffs_real[time_diffs_real == min_positive].index[0]
             nans_needed = round(sorted_diffs.iloc[idx_sorted_diffs] / periodicity_seconds)
-            
+
             if not_enough_data:
                 break
-            
+
             if nans_needed >= 2:
                 gap_period = min_positive / nans_needed
                 prev_reading_time = actual_reading_time
 
+                # synthetic rows in the gap: hodnota = NaN, is_anomaly = 0
                 for _ in range(nans_needed - 1):
                     expected_next = prev_reading_time + pd.Timedelta(seconds=gap_period)
                     expected_next = expected_next.round('s')
                     row_data = {
                         timestamp_col: expected_next,
-                        'hodnota': np.nan
+                        'hodnota': np.nan,
+                        'is_anomaly': 0.0,
                     }
                     result_rows.append(row_data)
                     prev_reading_time = expected_next
-            
+
             actual_reading_time = df.loc[next_real_index, timestamp_col]
             row_data = {
-                    timestamp_col: actual_reading_time,
-                    'hodnota': df.loc[next_real_index, 'hodnota']
+                timestamp_col: actual_reading_time,
+                'hodnota': df.loc[next_real_index, 'hodnota'],
+                'is_anomaly': df.loc[next_real_index, 'is_anomaly'],
             }
             result_rows.append(row_data)
             matched_indices.add(next_real_index)
             continue
-        
-        # Find the closest one among candidates
+
+        # There are candidates within tolerance: choose the closest
         closest_idx = min(candidate_indices, key=lambda idx: time_diffs[idx])
-        
-        # Add this reading to results
+
         row_data = {
             timestamp_col: df.loc[closest_idx, timestamp_col],
-            'hodnota': df.loc[closest_idx, 'hodnota']
-        }                
+            'hodnota': df.loc[closest_idx, 'hodnota'],
+            'is_anomaly': df.loc[closest_idx, 'is_anomaly'],
+        }
         result_rows.append(row_data)
         matched_indices.add(closest_idx)
-        
-        # Calculate next expected timestamp from the ACTUAL reading
+
         actual_reading_time = df.loc[closest_idx, timestamp_col]
-            
-            
+
     # Create the filled DataFrame
     filled_df = pd.DataFrame(result_rows)
-    
 
-    filled_df = filled_df[[timestamp_col, 'hodnota']]
-    
-    # Identify unmatched readings
+    # Ensure column order and presence
+    filled_df = filled_df[[timestamp_col, 'hodnota', 'is_anomaly']]
+
+    # Identify unmatched readings and diagnostics (unchanged, uses original df)
     unmatched_indices = [idx for idx in df.index if idx not in matched_indices]
-    
-    # Build detailed unmatched readings list
+    unmatched_detail = []
     try:
         for idx in unmatched_indices:
             row = df.loc[idx]
-
-            # Find what the expected slot would have been (closest in our result)
             if len(filled_df) > 0:
-                time_diffs_to_result = abs((filled_df[timestamp_col] - row[timestamp_col]).dt.total_seconds())
+                time_diffs_to_result = abs(
+                    (filled_df[timestamp_col] - row[timestamp_col]).dt.total_seconds()
+                )
                 nearest_result_idx = time_diffs_to_result.argmin()
                 expected_slot = filled_df.loc[nearest_result_idx, timestamp_col]
                 time_diff = time_diffs_to_result.iloc[nearest_result_idx]
@@ -183,7 +182,6 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
                 expected_slot = None
                 time_diff = None
 
-            # Get previous and next readings in the original data
             prev_idx = idx - 1 if idx > 0 else None
             next_idx = idx + 1 if idx < len(df) - 1 else None
 
@@ -204,10 +202,9 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
         print("Didnt manage to build unmatched reading list.")
 
     filled_diffs = filled_df[timestamp_col].diff()
-    min_allowed_diff = pd.Timedelta(seconds=periodicity_seconds*0.5)
-    max_allowed_diff = pd.Timedelta(seconds=periodicity_seconds*1.5)
+    min_allowed_diff = pd.Timedelta(seconds=periodicity_seconds * 0.5)
+    max_allowed_diff = pd.Timedelta(seconds=periodicity_seconds * 1.5)
     if ((min_allowed_diff > filled_diffs) | (filled_diffs > max_allowed_diff)).any():
-        #raise ValueError("Some timestamp differences in the new resampled df are larger or smaller then allowed.")
         for idx, diff in enumerate(filled_diffs):
             if min_allowed_diff > diff:
                 print(f"Periodicity used: {periodicity_seconds}")
@@ -215,33 +212,19 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
             elif diff > max_allowed_diff:
                 print(f"Periodicity used: {periodicity_seconds}")
                 print(f"Diff is larger then possible on idx: {idx} which is datetime {filled_df[timestamp_col].loc[idx]}")
-        
-    #diff_vals = []
-    #old_hodnota = np.nan
-    #for hodnota in filled_df['hodnota']:
-    #    if pd.isna(hodnota):
-    #        diff_vals.append(np.nan)
-    #        continue
-    #    diff_vals.append(hodnota - old_hodnota)
-    #    old_hodnota = hodnota
-    #    
-    #filled_df['Diff'] = diff_vals
-    
-    # Add Diff (diff needs to be recalculated so when there is a gap there is no diff after a gap)
+
+    # Recompute Diff
     filled_df['Diff'] = filled_df['hodnota'].diff()
-    # This is for metadata_001 (we allow 0.001 negative difference and set it to 0)
-    # Set Diff to np.nan where it is smaller than -0.001
     filled_df.loc[filled_df['Diff'] <= -0.002, 'Diff'] = np.nan
     filled_df.loc[(filled_df['Diff'] > -0.002) & (filled_df['Diff'] < 0), 'Diff'] = 0
-    
-    # Calculate diagnostics
+
     total_filled = len(filled_df)
     missing_count = filled_df['hodnota'].isna().sum()
     diff_nan_count = filled_df['Diff'].isna().sum()
-    
+
     timespan = (df.iloc[-1][timestamp_col] - df.iloc[0][timestamp_col]).total_seconds()
     expected_timestamps = timespan / periodicity_seconds
-    
+
     diagnostics = {
         'total_expected_timestamps': expected_timestamps,
         'total_actual_readings': len(df),
@@ -256,8 +239,9 @@ def fill_gaps_with_periodicity_adaptive(df, timestamp_col: str = 'timestamp_utc'
         'tolerance_percentage': tolerance_percentage,
         'tolerance_used_seconds': tolerance_seconds
     }
-    
+
     return filled_df, diagnostics
+
 
 
 def process_file_with_gap_filling(input_file: str, output_folder: str, output_folder_metadata: str, timestamp_col: str = 'timestamp_utc', tolerance_percentage=10):
