@@ -926,15 +926,15 @@ def main():
     random.seed(seed_value)
     
     csv_filepaths = random.sample(all_files, min(args.samples, len(all_files)))
-    #directory = "../data_w_anomalies"
-    #csv_filepaths = [
-    #    os.path.join(directory, f)
-    #    for f in os.listdir(directory)
-    #    if os.path.isfile(os.path.join(directory, f))
-    #]
+    directory = "../data_w_anomalies"
+    csv_filepaths = [
+        os.path.join(directory, f)
+        for f in os.listdir(directory)
+        if os.path.isfile(os.path.join(directory, f))
+    ]
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    output_csv = f"./results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_600_reworked.csv"
+    output_csv = f"./results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_600_reworked_w_anomalies.csv"
     
     _ = process_batch(
         csv_filepaths,

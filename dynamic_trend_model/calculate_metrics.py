@@ -313,7 +313,7 @@ def calculate_metrics(predictions_df):
         (non_zero_count / len(valid_actuals)) * 100 if len(valid_actuals) > 0 else 0
     )
 
-    if non_zero_count > 0:
+    if non_zero_count > 2:
         actuals_nz = valid_actuals[non_zero_mask]
         predictions_nz = valid_predictions[non_zero_mask]
         residuals_nz = valid_residuals[non_zero_mask]

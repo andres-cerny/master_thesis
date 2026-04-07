@@ -76,7 +76,19 @@ def fill_gaps_with_periodicity_adaptive(
     except ValueError as e:
         print(f"Couldn't find periodicity, skipping this df and getting an error: {e}")
         return df, {}
-
+    
+    if periodicity_seconds < 3*60:
+        raise ValueError("Periodicity is too small")
+    
+    if periodicity_seconds < 5*60:
+        periodicity_seconds = 5*periodicity_seconds
+    
+    if periodicity_seconds < 7*60:
+        periodicity_seconds = 3*periodicity_seconds
+        
+    if periodicity_seconds < 10*60:
+        periodicity_seconds = 2*periodicity_seconds
+    
     tolerance_seconds = (tolerance_percentage / 100.0) * periodicity_seconds
 
     result_rows = []

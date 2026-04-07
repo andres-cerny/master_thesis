@@ -242,6 +242,7 @@ def build_results_df(df_predict, predictions, result, threshold_z_score=3, thres
         anomalies = np.asarray(anomalies)
     else:
         anomalies = np.zeros(len(df_predict), dtype=float)
+        #TODO: fix so is_anomaly_actual is not saved when there are none
     
     timestamps = pd.to_datetime(timestamps, utc=True)
     actuals = np.asarray(actuals)
@@ -314,7 +315,7 @@ def train_model(df_train, seasonal_period_steps, result, initial_train=True, ini
     train_period = 'train'
     if not initial_train:
         train_period = 'second'
-    
+        
     t_start_train = time.time()
     try:
         model_train = UnobservedComponents(
@@ -331,8 +332,9 @@ def train_model(df_train, seasonal_period_steps, result, initial_train=True, ini
             model_train.initialize_known(
                 initial_state=init_state_mean, initial_state_cov=init_state_cov
             ) 
-                    
+
         res_train = model_train.fit(disp=False)
+
     except Exception as e:
         raise ValueError(f"Failed to fit {train_period} training model: {e}")
     
@@ -510,7 +512,7 @@ def split_df_sliding_weeks(
     result["periodicity_seconds"] = periodicity_seconds
 
     if periodicity_seconds == 0:
-        raise ValueError("Periodicitu is equal to 0")
+        raise ValueError("Periodicity is equal to 0")
     
     seasonal_period_steps = calculate_seasonal_period(periodicity_seconds)
     result["seasonal_period_steps"] = seasonal_period_steps
@@ -522,14 +524,21 @@ def split_df_sliding_weeks(
     # Week for prediction
     start_pred = chosen_end - pd.Timedelta(weeks=1)
     end_pred = chosen_end
-    
+
     # Weeks for second training
     start_second = start_pred - pd.Timedelta(weeks=weeks_train)
     end_second = start_pred
-    
+
     # Weeks for initial training
-    start_train = start_second - pd.Timedelta(weeks=weeks_train)
-    end_train = start_second
+    start_train = start_second - pd.Timedelta(weeks=1)
+    end_train = end_second - pd.Timedelta(weeks=1)
+    
+    if start_train < chosen_start:
+        raise ValueError(
+            f"Choosen 6 weeks segment starts on {chosen_start} " 
+            f"but initial start want to start earlier then that at {start_train}"
+            )
+    
 
     # Slice dataframes
     df_train = df_6w[
@@ -612,7 +621,7 @@ def process_single_meter(
         "status": "processing",
         "error": None,
     }
-
+    
     try:
         if verbose:
             logger.info(f"Processing {result['filename']}...")
@@ -635,6 +644,9 @@ def process_single_meter(
         df_raw["timestamp_utc"] = pd.to_datetime(df_raw["timestamp_utc"], utc=True)
         df_raw = df_raw.copy()
         df_raw.dropna(subset=["timestamp_utc"], inplace=True)
+        
+        if verbose:
+            logger.info(f"Processing {result['filename']} done, starting resampling...")
         
         # ===================================================================
         # RESAMPLE and SPLIT into 3 CHUNKS
@@ -669,6 +681,11 @@ def process_single_meter(
             freq_seasonal = None
             stochastic_freq_seasonal = None
             
+            
+        if verbose:
+            logger.info(f"{result['seasonal_period_steps']} and {len(df_train)}")
+            logger.info(f"Resampling {result['filename']} done, starting init training...")
+            
         # ===================================================================
         # INITIAL TRAINING
         # ===================================================================
@@ -680,6 +697,8 @@ def process_single_meter(
                                                          stochastic_freq_seasonal=stochastic_freq_seasonal,
                                                          )
         
+        if verbose:
+            logger.info(f"Init training done {result['filename']} done, starting init second train...")
         # ===================================================================
         # SECOND TRAINING
         # ===================================================================
@@ -695,11 +714,15 @@ def process_single_meter(
                                                                         freq_seasonal=freq_seasonal,
                                                                         stochastic_freq_seasonal=stochastic_freq_seasonal,
                                                                         )
+        if verbose:
+            logger.info(f"Second training done {result['filename']} done, injecting anomalies...")
         # ===================================================================
         # Inject anomalies to prediction df 
         # ===================================================================
         df_predict = inject_synthetic_anomalies(df_predict, random_state=int(result['filename']))
-                
+        
+        if verbose:
+            logger.info(f"Injection done {result['filename']} done, predicting...")    
         # ===================================================================
         # PREDICTION 
         # ===================================================================
@@ -719,10 +742,17 @@ def process_single_meter(
 
         if predictions_output_csv is not None:
             predictions_df.to_csv(predictions_output_csv, index=False)
-       
+
+        if verbose:
+            logger.info(f"Prediction done {result['filename']} done, calculating metrics...") 
         # ===================================================================
         # METRICS 
         # ===================================================================
+        if len(predictions_df) < 2 or len(df_predict_unresampled) < 2:
+            raise ValueError(
+                "Less than 2 data points in one of the prediction dfs for metric calculation."
+            )
+        
         metrics = calculate_metrics(predictions_df)
         
         metrics_unresampled = calculate_metrics_unresampled(df_predict_unresampled, predictions_df)
@@ -741,7 +771,7 @@ def process_single_meter(
                 f"RMSE: {metrics['rmse']:.4f}, MAE: {metrics['mae']:.4f}, "
                 f"R2: {metrics['r2']:.4f}, Seasonal Period: {seasonal_period_steps}"
             )
-
+        
         return result
 
     except Exception as e:
@@ -764,7 +794,7 @@ def process_batch(
     seasonal_cycle: str = "daily",
     num_workers: int = 4,
     verbose: bool = False,
-    per_file_timeout: int = 300,  # seconds; tune as needed (e.g. 300, 900)
+    per_file_timeout: int = 120,  # seconds; tune as needed (e.g. 300, 900)
 ):
     """
     Process multiple water meter CSV files in parallel with UnobservedComponents.
@@ -931,6 +961,10 @@ def main():
     random.seed(seed_value)
     
     csv_filepaths = random.sample(all_files, min(args.samples, len(all_files)))
+    
+    with open("../pickles/train_set.pkl", "rb") as f:
+        csv_filepaths = pickle.load(f)
+    
     #directory = "../data_w_anomalies"
     #csv_filepaths = [
     #    os.path.join(directory, f)
@@ -939,7 +973,7 @@ def main():
     #]
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    output_csv = f"./6_weeks_results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_600_reworked.csv"
+    output_csv = f"./6_weeks_results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_120_reworked_daily_all.csv"
     
     _ = process_batch(
         csv_filepaths,
