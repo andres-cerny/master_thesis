@@ -241,8 +241,7 @@ def build_results_df(df_predict, predictions, result, threshold_z_score=3, thres
         anomalies = df_predict["is_anomaly"].values
         anomalies = np.asarray(anomalies)
     else:
-        anomalies = np.zeros(len(df_predict), dtype=float)
-        #TODO: fix so is_anomaly_actual is not saved when there are none
+        anomalies = None
     
     timestamps = pd.to_datetime(timestamps, utc=True)
     actuals = np.asarray(actuals)
@@ -250,28 +249,29 @@ def build_results_df(df_predict, predictions, result, threshold_z_score=3, thres
 
     residuals = np.abs(actuals - predictions)
 
-    z_score, z_score_robust = compute_z_scores(residuals)
-
-    # build result df
     result_df = pd.DataFrame(
         {
             "timestamp_utc": timestamps,
             "actual": actuals,
             "predicted": predictions,
-            "residual": residuals,
-            "z_score": z_score,
-            "z_score_robust": z_score_robust,
-            "is_anomaly_actual": anomalies
+            "residual": residuals
         }
     )
-    result_df["is_anomaly_predicted"] = (np.abs(result_df["z_score"]) > 3).astype(int)
-    result_df["is_anomaly_robust_predicted"] = (np.abs(result_df["z_score_robust"]) > 3).astype(int)
     
-    result['number_of_anomalies'] = result_df["is_anomaly_predicted"].sum()
-    result['number_of_anomalies_robust'] = result_df["is_anomaly_robust_predicted"].sum()
+    if anomalies is not None:
+        z_score, z_score_robust = compute_z_scores(residuals)
+        result_df["z_score"] = z_score
+        result_df["z_score_robust"] = z_score_robust
+        result_df["is_anomaly_actual"] = anomalies
+            
+        result_df["is_anomaly_predicted"] = (np.abs(result_df["z_score"]) > 3).astype(int)
+        result_df["is_anomaly_robust_predicted"] = (np.abs(result_df["z_score_robust"]) > 3).astype(int)
+    
+        result['number_of_anomalies'] = result_df["is_anomaly_predicted"].sum()
+        result['number_of_anomalies_robust'] = result_df["is_anomaly_robust_predicted"].sum()
 
-    result['anomaly_indices'] = result_df.index[result_df["is_anomaly_predicted"] == 1].tolist()
-    result['anomaly_indices_robust'] = result_df.index[result_df["is_anomaly_robust_predicted"] == 1].tolist()
+        result['anomaly_indices'] = result_df.index[result_df["is_anomaly_predicted"] == 1].tolist()
+        result['anomaly_indices_robust'] = result_df.index[result_df["is_anomaly_robust_predicted"] == 1].tolist()
     
     return result_df
 
@@ -580,7 +580,7 @@ def process_single_meter(
     device: Optional[torch.device] = None,
     verbose: bool = False,
     predictions_output_csv: Optional[str] = None,
-    weekly_seasonality: bool = False,
+    weekly_seasonality: bool = True,
     daily_steps: bool = True,
     threshold_z_score: int = 3,
     threshold_z_score_robust: int = 3
@@ -719,7 +719,7 @@ def process_single_meter(
         # ===================================================================
         # Inject anomalies to prediction df 
         # ===================================================================
-        df_predict = inject_synthetic_anomalies(df_predict, random_state=int(result['filename']))
+        #df_predict = inject_synthetic_anomalies(df_predict, random_state=int(result['filename']))
         
         if verbose:
             logger.info(f"Injection done {result['filename']} done, predicting...")    
@@ -753,12 +753,13 @@ def process_single_meter(
                 "Less than 2 data points in one of the prediction dfs for metric calculation."
             )
         
-        metrics = calculate_metrics(predictions_df)
+        #metrics = calculate_metrics(predictions_df)
+    #
+        #for key, value in metrics.items():
+        #    result[f"metric_{key}"] = value
         
         metrics_unresampled = calculate_metrics_unresampled(df_predict_unresampled, predictions_df)
         
-        for key, value in metrics.items():
-            result[f"metric_{key}"] = value
             
         for key, value in metrics_unresampled.items():
             result[f"unresampled_metric_{key}"] = value
@@ -768,8 +769,8 @@ def process_single_meter(
         if verbose:
             logger.info(
                 f"Processed successfully (Seasonal UC): {result['filename']} - "
-                f"RMSE: {metrics['rmse']:.4f}, MAE: {metrics['mae']:.4f}, "
-                f"R2: {metrics['r2']:.4f}, Seasonal Period: {seasonal_period_steps}"
+                f"RMSE: {metrics_unresampled['rmse']:.4f}, MAE: {metrics_unresampled['mae']:.4f}, "
+                f"R2: {metrics_unresampled['r2']:.4f}, Seasonal Period: {seasonal_period_steps}"
             )
         
         return result
@@ -884,28 +885,6 @@ def process_batch(
     logger.info(f"Failed: {(results_df['status'] == 'failed').sum()}")
     logger.info(f"Metrics saved to: {output_csv}")
 
-    successful = results_df[results_df["status"] == "success"]
-    if len(successful) > 0:
-        logger.info("Metrics Summary (successful runs only):")
-        logger.info(
-            f"  RMSE: {successful['metric_rmse'].mean():.4f} +/- {successful['metric_rmse'].std():.4f}"
-        )
-        logger.info(
-            f"  MAE:  {successful['metric_mae'].mean():.4f} +/- {successful['metric_mae'].std():.4f}"
-        )
-        logger.info(
-            f"  R2:   {successful['metric_r2'].mean():.4f} +/- {successful['metric_r2'].std():.4f}"
-        )
-        logger.info(
-            f"  MAPE: {successful['metric_mape'].mean():.4f} +/- {successful['metric_mape'].std():.4f}"
-        )
-        logger.info(
-            f"  Valid data %: {successful['metric_valid_percentage'].mean():.2f}%"
-        )
-        logger.info(
-            f"  NaN samples: {successful['metric_nan_count'].mean():.1f} avg per meter"
-        )
-
     return results_df
 
 
@@ -962,8 +941,10 @@ def main():
     
     csv_filepaths = random.sample(all_files, min(args.samples, len(all_files)))
     
-    with open("../pickles/train_set.pkl", "rb") as f:
+    with open("../pickles/test_set.pkl", "rb") as f:
         csv_filepaths = pickle.load(f)
+        
+    #csv_filepaths = csv_filepaths[15000:]
     
     #directory = "../data_w_anomalies"
     #csv_filepaths = [
@@ -973,7 +954,7 @@ def main():
     #]
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    output_csv = f"./6_weeks_results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_120_reworked_daily_all.csv"
+    output_csv = f"./6_weeks_results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_120_reworked_daily_steps_weekly_fourier_test.csv"
     
     _ = process_batch(
         csv_filepaths,
