@@ -65,6 +65,10 @@ def _binary_classification_metrics(y_true, y_pred):
             "tn": np.nan,
             "fp": np.nan,
             "fn": np.nan,
+            "accuracy": np.nan,
+            "precision": np.nan,
+            "recall": np.nan,
+            "f1": np.nan,
         }
 
     tp = np.sum((y_pred == 1) & (y_true == 1))
@@ -72,12 +76,24 @@ def _binary_classification_metrics(y_true, y_pred):
     fp = np.sum((y_pred == 1) & (y_true == 0))
     fn = np.sum((y_pred == 0) & (y_true == 1))
 
+    total = tp + tn + fp + fn
+    accuracy = (tp + tn) / total if total > 0 else np.nan
+    precision = tp / (tp + fp) if (tp + fp) > 0 else np.nan
+    recall = tp / (tp + fn) if (tp + fn) > 0 else np.nan
+    if np.isnan(precision) or np.isnan(recall) or (precision + recall) == 0:
+        f1 = np.nan
+    else:
+        f1 = 2 * precision * recall / (precision + recall)
+
     return {
         "tp": tp,
         "tn": tn,
         "fp": fp,
         "fn": fn,
-
+        "accuracy": accuracy,
+        "precision": precision,
+        "recall": recall,
+        "f1": f1,
     }
 
 
@@ -178,6 +194,10 @@ def calculate_metrics(predictions_df):
             "pred_tn": m_pred["tn"],
             "pred_fp": m_pred["fp"],
             "pred_fn": m_pred["fn"],
+            "pred_accuracy": m_pred["accuracy"],
+            "pred_precision": m_pred["precision"],
+            "pred_recall": m_pred["recall"],
+            "pred_f1": m_pred["f1"],
         })
     else:
         metrics.update({
@@ -185,6 +205,10 @@ def calculate_metrics(predictions_df):
             "pred_tn": np.nan,
             "pred_fp": np.nan,
             "pred_fn": np.nan,
+            "pred_accuracy": np.nan,
+            "pred_precision": np.nan,
+            "pred_recall": np.nan,
+            "pred_f1": np.nan,
         })
 
     if y_true is not None and has_robust:
@@ -195,6 +219,10 @@ def calculate_metrics(predictions_df):
             "robust_pred_tn": m_rob["tn"],
             "robust_pred_fp": m_rob["fp"],
             "robust_pred_fn": m_rob["fn"],
+            "robust_pred_accuracy": m_rob["accuracy"],
+            "robust_pred_precision": m_rob["precision"],
+            "robust_pred_recall": m_rob["recall"],
+            "robust_pred_f1": m_rob["f1"],
         })
     else:
         metrics.update({
@@ -202,6 +230,10 @@ def calculate_metrics(predictions_df):
             "robust_pred_tn": np.nan,
             "robust_pred_fp": np.nan,
             "robust_pred_fn": np.nan,
+            "robust_pred_accuracy": np.nan,
+            "robust_pred_precision": np.nan,
+            "robust_pred_recall": np.nan,
+            "robust_pred_f1": np.nan,
         })
 
     # MAPE

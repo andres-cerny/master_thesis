@@ -7,3 +7,4 @@ result*
 *.pkl
 *copy.py
 test
+remove_long_train.ipynb
