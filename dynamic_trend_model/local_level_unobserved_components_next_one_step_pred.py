@@ -170,35 +170,67 @@ def calculate_seasonal_period(
 
 import numpy as np
 
-def compute_z_scores(residuals):
-    # Ensure float numpy array
+def compute_z_scores(residuals, ref_residuals=None):
+    """
+    Compute z-score and robust MAD-based score for each residual.
+
+    Statistics (mean, std, median, MAD) are estimated from ref_residuals
+    (intended to be the second training segment residuals) and then applied
+    to score residuals (intended to be the prediction segment residuals).
+    If ref_residuals is None, residuals itself is used as the reference,
+    which matches the old behaviour.
+
+    Parameters:
+    -----------
+    residuals : array-like
+        Residuals to be scored (prediction segment).
+    ref_residuals : array-like or None
+        Reference residuals used to estimate thresholding statistics
+        (second training segment). If None, falls back to residuals.
+
+    Returns:
+    --------
+    z_score : np.ndarray
+        Classical z-scores for each element of residuals.
+    z_score_robust : np.ndarray
+        Robust MAD-based scores for each element of residuals.
+    """
+    # Ensure float numpy arrays
     residuals = np.asarray(residuals, dtype=float)
 
-    # Mask valid (non-NaN) residuals
+    # Use ref_residuals for statistics if provided, otherwise fall back to residuals
+    if ref_residuals is not None:
+        ref = np.asarray(ref_residuals, dtype=float)
+    else:
+        ref = residuals
+
+    # Mask valid (non-NaN) values
+    valid_ref = ref[~np.isnan(ref)]
     valid = ~np.isnan(residuals)
-    res_valid = residuals[valid]
 
     # Initialize outputs
     z_score = np.full_like(residuals, np.nan)
     z_score_robust = np.full_like(residuals, np.nan)
 
-    # If no usable residuals -> all NaN
-    if res_valid.size == 0:
+    # If no usable reference residuals -> all NaN
+    if valid_ref.size == 0:
         return z_score, z_score_robust
 
     # ---------- Classic mean/std z-score ----------
-    res_mean = np.nanmean(res_valid)
-    res_std = np.nanstd(res_valid, ddof=1)
+    # Statistics estimated from the reference (second training) segment
+    res_mean = np.nanmean(valid_ref)
+    res_std = np.nanstd(valid_ref, ddof=1)
 
     if not (np.isnan(res_std) or res_std == 0):
-        z_score[valid] = (res_valid - res_mean) / res_std
+        z_score[valid] = (residuals[valid] - res_mean) / res_std
     else:
         # No variability: treat all valid points as typical
         z_score[valid] = 0.0
 
     # ---------- Robust median/MAD z-score ----------
-    median_resid = np.nanmedian(res_valid)
-    mad = np.nanmedian(np.abs(res_valid - median_resid))
+    # Statistics estimated from the reference (second training) segment
+    median_resid = np.nanmedian(valid_ref)
+    mad = np.nanmedian(np.abs(valid_ref - median_resid))
 
     # Fallback to classic std if MAD unusable
     if np.isnan(mad) or mad == 0:
@@ -210,13 +242,13 @@ def compute_z_scores(residuals):
         # No variability: all valid z_robust = 0
         z_score_robust[valid] = 0.0
     else:
-        z_score_robust[valid] = (res_valid - median_resid) / sigma_robust
+        z_score_robust[valid] = (residuals[valid] - median_resid) / sigma_robust
 
     return z_score, z_score_robust
 
 
 
-def build_results_df(df_predict, predictions, result, threshold_z_score=3, threshold_z_score_robust=3):
+def build_results_df(df_predict, predictions, result, ref_residuals=None, threshold_z_score=3, threshold_z_score_robust=3):
     """
     Build a result DataFrame with anomaly scores based on residuals.
 
@@ -224,12 +256,20 @@ def build_results_df(df_predict, predictions, result, threshold_z_score=3, thres
 
     Parameters:
     -----------
-    timestamps : array-like
-        Timestamp array (will be converted to datetime UTC)
-    actuals : array-like
-        Actual Diff values (may contain NaN)
+    df_predict : pd.DataFrame
+        Prediction segment dataframe with 'Diff' and 'timestamp_utc' columns.
     predictions : array-like
-        Predicted Diff values (may contain NaN)
+        Predicted Diff values (may contain NaN).
+    result : dict
+        Result dictionary to store summary counts.
+    ref_residuals : array-like or None
+        Residuals from the second training segment used to estimate
+        thresholding statistics (mean, std, median, MAD). If None,
+        the prediction segment residuals are used instead (old behaviour).
+    threshold_z_score : int
+        Threshold for the classical z-score (default: 3).
+    threshold_z_score_robust : int
+        Threshold for the robust MAD-based score (default: 3).
 
     Returns:
     --------
@@ -261,13 +301,15 @@ def build_results_df(df_predict, predictions, result, threshold_z_score=3, thres
     )
     
     if anomalies is not None:
-        z_score, z_score_robust = compute_z_scores(residuals)
+        # Scores are computed on prediction residuals, but thresholding statistics
+        # (mean, std, median, MAD) are estimated from ref_residuals (second training segment)
+        z_score, z_score_robust = compute_z_scores(residuals, ref_residuals=ref_residuals)
         result_df["z_score"] = z_score
         result_df["z_score_robust"] = z_score_robust
         result_df["is_anomaly_actual"] = anomalies
             
-        result_df["is_anomaly_predicted"] = (np.abs(result_df["z_score"]) > 3).astype(int)
-        result_df["is_anomaly_robust_predicted"] = (np.abs(result_df["z_score_robust"]) > 3).astype(int)
+        result_df["is_anomaly_predicted"] = (np.abs(result_df["z_score"]) > threshold_z_score).astype(int)
+        result_df["is_anomaly_robust_predicted"] = (np.abs(result_df["z_score_robust"]) > threshold_z_score_robust).astype(int)
 
         result['number_of_anomalies_actual'] = result_df["is_anomaly_actual"].sum()
         result['number_of_anomalies'] = result_df["is_anomaly_predicted"].sum()
@@ -343,7 +385,6 @@ def train_model(df_train, seasonal_period_steps, result, initial_train=True, ini
     
     result[f"converged_{train_period}"] = res_train.mle_retvals['converged']
     if not res_train.mle_retvals['converged']:
-        #logger.info(f"Did not converge because of {res_train.mle_retvals['warnflag']} at value {res_train.mle_retvals['gopt']}")
         result[f'warnflag_{train_period}'] = res_train.mle_retvals['warnflag']
         result[f"gopt_{train_period}"] = res_train.mle_retvals['gopt']
     else:
@@ -365,9 +406,14 @@ def train_model(df_train, seasonal_period_steps, result, initial_train=True, ini
     return last_state_mean, last_state_cov, theta_train
 
 # ============================================================================
-# PREDICT MODEL
+# PREDICT MODEL — BATCH (vectorized, used for reference residuals on df_second)
 # ============================================================================
-def predict_model(df_predict, seasonal_period_steps, result, init_state_mean, init_state_cov, theta, freq_seasonal=None, stochastic_freq_seasonal=None):    
+def predict_model_batch(df_predict, seasonal_period_steps, result, init_state_mean, init_state_cov, theta, freq_seasonal=None, stochastic_freq_seasonal=None):
+    """
+    Vectorized Kalman filter pass over df_predict using fixed parameters theta.
+    Used to obtain reference residuals from the clean second training segment.
+    NaN observations are handled by statsmodels (measurement update skipped).
+    """
     y_pred_segment = df_predict["Diff"].values.astype(float)
     
     t_start_pred = time.time()
@@ -382,27 +428,156 @@ def predict_model(df_predict, seasonal_period_steps, result, init_state_mean, in
             stochastic_freq_seasonal=stochastic_freq_seasonal,
         )
         
-        # Initialize from last state of second training segment
         if init_state_mean is not None and init_state_cov is not None:
             model_pred.initialize_known(
                 initial_state=init_state_mean, initial_state_cov=init_state_cov
             )
             
-        # Filter with parameters from second training
         res_pred = model_pred.filter(theta)
-        # Get one-step-ahead predictions
         pred_obj = res_pred.get_prediction()
         pred_mean = pred_obj.predicted_mean
         pred_mean = np.asarray(pred_mean, dtype=float)
         pred_mean = np.clip(pred_mean, 0.0, None)
         
     except Exception as e:
-        raise ValueError(f"Failed to generate predictions: {e}")
+        raise ValueError(f"Failed to generate batch predictions: {e}")
     
+    t_end_pred = time.time()
+    result["second_prediction_time_seconds"] = t_end_pred - t_start_pred
+
+    return pred_mean
+
+
+# ============================================================================
+# PREDICT MODEL — ONLINE (step-by-step, used for prediction segment)
+# ============================================================================
+def predict_model_online(df_predict, seasonal_period_steps, result, init_state_mean, init_state_cov, theta,
+                         freq_seasonal=None, stochastic_freq_seasonal=None,
+                         ref_residuals=None, z_threshold=3):
+    """
+    One-step-ahead prediction with online anomaly masking.
+
+    At each time step the Kalman filter:
+      1. Produces the prior predicted observation y_hat from the current state.
+      2. Computes the residual |y_t - y_hat| and its z-score using statistics
+         estimated from ref_residuals (second training segment).
+      3. If |z| > z_threshold OR y_t is NaN: skips the measurement update so
+         the anomalous value does not corrupt the state carried forward.
+      4. Otherwise: performs the standard Kalman measurement update.
+
+    This mirrors production behaviour where anomalous observations are not
+    incorporated into the state, preventing a single spike from degrading
+    predictions at subsequent time steps.
+
+    Parameters:
+    -----------
+    ref_residuals : array-like or None
+        Residuals from the second training segment used to compute the
+        reference mean and std for online z-score thresholding.
+        If None, masking is only applied to NaN observations.
+    z_threshold : float
+        Z-score threshold above which an observation is treated as anomalous
+        and excluded from the measurement update (default: 3).
+    """
+    y_pred_segment = df_predict["Diff"].values.astype(float)
+    n = len(y_pred_segment)
+
+    # Pre-compute reference statistics from second training residuals
+    if ref_residuals is not None:
+        ref = np.asarray(ref_residuals, dtype=float)
+        valid_ref = ref[~np.isnan(ref)]
+        ref_mean = float(np.nanmean(valid_ref)) if valid_ref.size > 0 else 0.0
+        ref_std  = float(np.nanstd(valid_ref, ddof=1)) if valid_ref.size > 1 else None
+    else:
+        ref_mean = None
+        ref_std  = None
+        
+    result['ref_mean'] = ref_mean
+    result['ref_std'] = ref_std
+
+    t_start_pred = time.time()
+    try:
+        # Build the model with a dummy endog to extract system matrices.
+        # We only need the matrices, not a fit — update(theta) populates them.
+        model_pred = UnobservedComponents(
+            endog=np.zeros(n),
+            level="local level",
+            seasonal=seasonal_period_steps,
+            freq_seasonal=freq_seasonal,
+            stochastic_level=True,
+            stochastic_seasonal=True,
+            stochastic_freq_seasonal=stochastic_freq_seasonal,
+        )
+        model_pred.update(theta)
+
+        # Statsmodels stores time-invariant matrices as either 2D (k, k)
+        # or 3D (k, k, nobs). This helper handles both cases.
+        def get_mat(name):
+            m = model_pred.ssm[name]
+            return m[:, :, 0] if m.ndim == 3 else m
+
+        # T : state transition          (k_states, k_states)
+        # Z : observation/design        (1, k_states)
+        # R : selection                 (k_states, k_posdef)
+        # Q : state noise cov           (k_posdef, k_posdef)
+        # H : observation noise cov     (1, 1)
+        T = get_mat('transition')
+        Z = get_mat('design')
+        R = get_mat('selection')
+        Q = get_mat('state_cov')
+        H = get_mat('obs_cov')
+
+        # Full process noise covariance: R @ Q @ R.T
+        Q_full = R @ Q @ R.T
+        k = T.shape[0]
+        I = np.eye(k)
+
+        # Initialise state from the end of the second training segment
+        x = init_state_mean.copy().reshape(-1)
+        P = init_state_cov.copy()
+
+        predictions = np.full(n, np.nan)
+
+        for t in range(n):
+            # ── Prediction step ──────────────────────────────────────────
+            x_prior = T @ x
+            P_prior = T @ P @ T.T + Q_full
+
+            y_hat = float(Z @ x_prior)
+            predictions[t] = max(y_hat, 0.0)   # clip negatives
+
+            y_t = y_pred_segment[t]
+
+            # ── Decide whether to update or skip ─────────────────────────
+            skip_update = bool(np.isnan(y_t))
+
+            if not skip_update and ref_std is not None and ref_std > 0:
+                residual = abs(y_t - y_hat)
+                z = (residual - ref_mean) / ref_std
+                if abs(z) > z_threshold:
+                    skip_update = True
+
+            # ── Measurement update ────────────────────────────────────────
+            if skip_update:
+                # Anomalous or missing: propagate state without updating
+                x = x_prior
+                P = P_prior
+            else:
+                S = float(Z @ P_prior @ Z.T + H)        # innovation variance
+                K = (P_prior @ Z.T) / S                 # Kalman gain (k, 1)
+                innovation = y_t - y_hat
+                x = x_prior + K.flatten() * innovation
+                # Joseph form for numerical stability
+                IKZ = I - K @ Z
+                P = IKZ @ P_prior @ IKZ.T + K * H[0, 0] @ K.T
+
+    except Exception as e:
+        raise ValueError(f"Failed to generate online predictions: {e}")
+
     t_end_pred = time.time()
     result["prediction_time_seconds"] = t_end_pred - t_start_pred
 
-    return pred_mean
+    return predictions
 
 def split_df_sliding_weeks(
     df_raw,
@@ -453,21 +628,17 @@ def split_df_sliding_weeks(
             & (daily_counts["date"] <= window_days.max())
         ]
 
-        # Merge to ensure all days are present (including those with 0 counts)
         df_counts_full = (
             pd.DataFrame({"date": window_days})
             .merge(df_counts_window, on="date", how="left")
             .fillna({"count": 0})
         )
 
-        # Condition: each day must have at least one measurement
         return (df_counts_full["count"] >= min_days_with_data_per_day).all()
 
-    # Randomly choose a 6-week window that satisfies the "no big gaps" condition
     rng = default_rng(seed)
 
     max_start = max_ts - pd.Timedelta(days=total_days_required)
-    # We attempt several random draws; if none succeed, we fail
     max_tries = 30
     chosen_start = None
 
@@ -475,12 +646,10 @@ def split_df_sliding_weeks(
         u = rng.random()
         rand_start = min_ts + (max_start - min_ts) * u
         rand_start = pd.to_datetime(rand_start)
-        # Align to midnight for clearer week boundaries
         rand_start = rand_start.floor("D")
 
         rand_end = rand_start + pd.Timedelta(days=total_days_required)
 
-        # Check window fits into data span
         if rand_end > max_ts:
             continue
 
@@ -541,7 +710,6 @@ def split_df_sliding_weeks(
             f"Choosen 6 weeks segment starts on {chosen_start} " 
             f"but initial start want to start earlier then that at {start_train}"
             )
-    
 
     # Slice dataframes
     df_train = df_6w[
@@ -583,7 +751,7 @@ def process_single_meter(
     device: Optional[torch.device] = None,
     verbose: bool = False,
     predictions_output_csv: Optional[str] = None,
-    weekly_seasonality: bool = False,
+    weekly_seasonality: bool = True,
     daily_steps: bool = True,
     threshold_z_score: int = 3,
     threshold_z_score_robust: int = 3
@@ -597,6 +765,11 @@ def process_single_meter(
     - Weeks 1–4 of that window: initial training.
     - Weeks 2–5 of that window: second training (initialized from previous state).
     - Week 6 of that window: prediction (initialized from previous state, anomalies injected only here).
+
+    Anomaly scoring:
+    - Thresholding statistics (mean, std, median, MAD) are estimated from the
+      second training segment residuals and then applied to score the prediction
+      segment residuals, so that the calibration window is anomaly-free.
 
     Parameters:
     -----------
@@ -684,8 +857,6 @@ def process_single_meter(
             freq_seasonal = None
             stochastic_freq_seasonal = None
             
-
-            
         if verbose:
             logger.info(f"{result['seasonal_period_steps']} and {len(df_train)}")
             logger.info(f"Resampling {result['filename']} done, starting init training...")
@@ -703,6 +874,7 @@ def process_single_meter(
         
         if verbose:
             logger.info(f"Init training done {result['filename']} done, starting init second train...")
+
         # ===================================================================
         # SECOND TRAINING
         # ===================================================================
@@ -719,7 +891,30 @@ def process_single_meter(
                                                                         stochastic_freq_seasonal=stochastic_freq_seasonal,
                                                                         )
         if verbose:
-            logger.info(f"Second training done {result['filename']} done, injecting anomalies...")
+            logger.info(f"Second training done {result['filename']}, computing reference residuals...")
+
+        # ===================================================================
+        # COMPUTE REFERENCE RESIDUALS FROM SECOND TRAINING SEGMENT
+        # These residuals are used to estimate thresholding statistics
+        # (mean, std, median, MAD) for anomaly scoring, ensuring the
+        # calibration window is anomaly-free.
+        # ===================================================================
+        second_predictions = predict_model_batch(
+            df_predict=df_second,
+            seasonal_period_steps=seasonal_period_steps,
+            result=result,
+            init_state_mean=init_second_mean,   # state from end of initial training
+            init_state_cov=init_second_cov,
+            theta=theta_second,
+            freq_seasonal=freq_seasonal,
+            stochastic_freq_seasonal=stochastic_freq_seasonal,
+        )
+        second_actuals = df_second["Diff"].values.astype(float)
+        second_residuals = np.abs(second_actuals - second_predictions)
+
+        if verbose:
+            logger.info(f"Reference residuals computed for {result['filename']}, injecting anomalies...")
+
         # ===================================================================
         # Inject anomalies to prediction df 
         # ===================================================================
@@ -727,28 +922,43 @@ def process_single_meter(
         
         if verbose:
             logger.info(f"Injection done {result['filename']} done, predicting...")    
+
         # ===================================================================
         # PREDICTION 
         # ===================================================================
         init_predict_mean = last_state_mean_2
         init_predict_cov = last_state_cov_2
             
-        predictions_mean = predict_model(df_predict=df_predict,
-                                        seasonal_period_steps=seasonal_period_steps,
-                                        result=result,
-                                        init_state_mean=init_predict_mean,
-                                        init_state_cov=init_predict_cov,
-                                        theta=theta_second,
-                                        freq_seasonal=freq_seasonal,
-                                        )
-        # Build results dataframe (keeps NaN values)
-        predictions_df = build_results_df(df_predict, predictions_mean, result, threshold_z_score, threshold_z_score_robust)
+        predictions_mean = predict_model_online(
+            df_predict=df_predict,
+            seasonal_period_steps=seasonal_period_steps,
+            result=result,
+            init_state_mean=init_predict_mean,
+            init_state_cov=init_predict_cov,
+            theta=theta_second,
+            freq_seasonal=freq_seasonal,
+            stochastic_freq_seasonal=stochastic_freq_seasonal,
+            ref_residuals=second_residuals,
+            z_threshold=threshold_z_score,
+        )
+
+        # Build results dataframe: scores applied to prediction residuals,
+        # but statistics estimated from second training segment residuals.
+        predictions_df = build_results_df(
+            df_predict,
+            predictions_mean,
+            result,
+            ref_residuals=second_residuals,
+            threshold_z_score=threshold_z_score,
+            threshold_z_score_robust=threshold_z_score_robust,
+        )
 
         if predictions_output_csv is not None:
             predictions_df.to_csv(predictions_output_csv, index=False)
 
         if verbose:
             logger.info(f"Prediction done {result['filename']} done, calculating metrics...") 
+
         # ===================================================================
         # METRICS 
         # ===================================================================
@@ -758,25 +968,12 @@ def process_single_meter(
             )
         
         metrics = calculate_metrics(predictions_df)
-    #
+
         for key, value in metrics.items():
             result[f"metric_{key}"] = value
-        
-        #metrics_unresampled = calculate_metrics_unresampled(df_predict_unresampled, predictions_df)
-        #
-        #    
-        #for key, value in metrics_unresampled.items():
-        #    result[f"unresampled_metric_{key}"] = value
 
         result["status"] = "success"
 
-        #if verbose:
-        #    logger.info(
-        #        f"Processed successfully (Seasonal UC): {result['filename']} - "
-        #        f"RMSE: {metrics_unresampled['rmse']:.4f}, MAE: {metrics_unresampled['mae']:.4f}, "
-        #        f"R2: {metrics_unresampled['r2']:.4f}, Seasonal Period: {seasonal_period_steps}"
-        #    )
-        #
         return result
 
     except Exception as e:
@@ -786,8 +983,6 @@ def process_single_meter(
         if verbose:
             logger.debug(traceback.format_exc())
         return result
-
-
 # ============================================================================
 # BATCH PROCESSING WITH MULTITHREADING
 # ============================================================================
@@ -958,7 +1153,7 @@ def main():
     #]
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    output_csv = f"./6_weeks_results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_120_reworked_daily_steps_anomalies_test.csv"
+    output_csv = f"./6_weeks_results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_120_reworked_daily_steps_weekly_fourier_anomalies_test.csv"
     
     _ = process_batch(
         csv_filepaths,

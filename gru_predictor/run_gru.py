@@ -1,123 +1,412 @@
 """
-GRU Batch Processor for Water Meter Anomaly Detection (PREDICTION-BASED)
-=========================================================================
-
-Processes multiple water meter CSV files with:
-- Sequence-to-point prediction (predict X_t from X_{t-window_size}...X_{t-1})
-- Multithreaded execution
-- Configurable periodicity (window_size)
-- Training on 3-2 months ago data (50 epochs)
-- Warm-start retraining on 2-1 months ago data
-- Prediction on last month of data
-- Comprehensive metrics calculation
-
-Key Changes from Reconstruction Model:
-- GRUNet: Uses only last hidden state for single-value prediction
-- MeterDataset: Returns scalar target (X_t) instead of sequence
-- Training: Predicts one value per window (3-4x faster)
-- Prediction: Rolling window approach for each timestamp
-
+GRU Batch Processor for Water Meter Anomaly Detection (SLIDING WINDOW)
+=======================================================================
+ 
+Reworked to match the UnobservedComponents model exactly so results are
+directly comparable:
+ 
+  Splitting  – identical sliding-window logic from split_df_sliding_weeks()
+               (random 6-week window, seed = int(filename), numpy default_rng)
+               • Weeks 1–4  → initial training
+               • Weeks 2–5  → warm-start retraining
+               • Week  6    → prediction
+  Resampling – fill_gaps_with_periodicity_adaptive(), same as UC model
+  Window     – one seasonal period (= one day at the meter's periodicity)
+  Metrics    – calculate_metrics() / calculate_metrics_unresampled(), same
+               imports as UC model; local calculate_metrics() removed
+  z-score    – same compute_z_scores() / build_results_df() helpers
+  Batch      – ProcessPoolExecutor with per-file timeout (mirrors UC)
+ 
 Usage:
-    python gru_prediction_refactored.py
+    python run_gru_sliding_window.py --workers 7 --verbose
 """
-
+ 
 import os
-import json
-import pandas as pd
-import numpy as np
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-from sklearn.preprocessing import StandardScaler
-from sklearn.metrics import (
-    mean_squared_error,
-    mean_absolute_error,
-    r2_score,
-    mean_absolute_percentage_error,
-)
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from pathlib import Path
-import logging
-from datetime import datetime, timedelta
-import traceback
-from typing import Dict, Tuple, Optional, List
-import warnings
+import pickle
 import random
 import time
+import logging
+import traceback
+import warnings
+from concurrent.futures import ProcessPoolExecutor, as_completed, TimeoutError
+from pathlib import Path
+from typing import Dict, List, Optional
+ 
+import numpy as np
+import pandas as pd
+import torch
+import torch.nn as nn
+from numpy.random import default_rng
+from torch.utils.data import Dataset, DataLoader
+from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
-
-from pandas.tseries.offsets import DateOffset
-
+ 
+from calculate_metrics import calculate_metrics
+from create_anomalies import inject_spike_anomalies_diff
+ 
 warnings.filterwarnings("ignore")
-
-
+ 
+ 
 # ============================================================================
-# LOGGING SETUP
+# LOGGING
 # ============================================================================
-
-
-def setup_logging(log_file="gru_batch_processor.log", verbose: bool = False):
-    """Configure logging to file and console"""
+ 
+def setup_logging(log_file="gru_sliding_window.log", verbose: bool = False):
     level = logging.DEBUG if verbose else logging.INFO
-
     logger = logging.getLogger(__name__)
     logger.setLevel(level)
-
-    # Clear existing handlers (important when re-running in notebooks)
     if logger.hasHandlers():
         logger.handlers.clear()
-
-    formatter = logging.Formatter(
-        "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
-    )
-
-    file_handler = logging.FileHandler(log_file, encoding="utf-8")
-    file_handler.setLevel(level)
-    file_handler.setFormatter(formatter)
-
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(level)
-    console_handler.setFormatter(formatter)
-
-    logger.addHandler(file_handler)
-    logger.addHandler(console_handler)
-
+    fmt = logging.Formatter("%(asctime)s - %(name)s - %(levelname)s - %(message)s")
+    fh = logging.FileHandler(log_file, encoding="utf-8")
+    fh.setLevel(level)
+    fh.setFormatter(fmt)
+    ch = logging.StreamHandler()
+    ch.setLevel(level)
+    ch.setFormatter(fmt)
+    logger.addHandler(fh)
+    logger.addHandler(ch)
     return logger
-
-
-# Default logger; will be reconfigured in main() with verbose flag
+ 
+ 
 logger = setup_logging(verbose=False)
-
-
+ 
+def get_periodicity(df: pd.DataFrame, timestamp_col: str = 'timestamp_utc') -> int:
+    """
+    Returns:
+    --------
+    int
+        Most common periodicity in DataFrame
+    """
+    df[timestamp_col] = pd.to_datetime(df[timestamp_col], utc=True)
+        
+    time_diffs = df[timestamp_col].diff().dropna().dt.total_seconds()
+    
+    if time_diffs.empty:
+        raise ValueError("No time difference calculated. No two valid neighboring values found.")
+ 
+    common_periodicity_mode = time_diffs.mode()
+    return common_periodicity_mode.iloc[0]
+ 
+ 
 # ============================================================================
-# GRU MODEL DEFINITION
+# HELPERS: z-scores and result dataframe  (identical to UC model)
 # ============================================================================
-
-
+ 
+def compute_z_scores(residuals, ref_residuals=None):
+    """
+    Compute z-score and robust MAD-based score for each residual.
+ 
+    Statistics (mean, std, median, MAD) are estimated from ref_residuals
+    (intended to be the second training segment residuals) and then applied
+    to score residuals (intended to be the prediction segment residuals).
+    If ref_residuals is None, residuals itself is used as the reference,
+    which matches the old behaviour.
+ 
+    Parameters:
+    -----------
+    residuals : array-like
+        Residuals to be scored (prediction segment).
+    ref_residuals : array-like or None
+        Reference residuals used to estimate thresholding statistics
+        (second training segment). If None, falls back to residuals.
+ 
+    Returns:
+    --------
+    z_score : np.ndarray
+        Classical z-scores for each element of residuals.
+    z_score_robust : np.ndarray
+        Robust MAD-based scores for each element of residuals.
+    """
+    residuals = np.asarray(residuals, dtype=float)
+ 
+    # Use ref_residuals for statistics if provided, otherwise fall back to residuals
+    if ref_residuals is not None:
+        ref = np.asarray(ref_residuals, dtype=float)
+    else:
+        ref = residuals
+ 
+    # Mask valid (non-NaN) values
+    valid_ref = ref[~np.isnan(ref)]
+    valid = ~np.isnan(residuals)
+ 
+    z_score = np.full_like(residuals, np.nan)
+    z_score_robust = np.full_like(residuals, np.nan)
+ 
+    if valid_ref.size == 0:
+        return z_score, z_score_robust
+ 
+    # ---------- Classic mean/std z-score ----------
+    # Statistics estimated from the reference (second training) segment
+    res_mean = np.nanmean(valid_ref)
+    res_std  = np.nanstd(valid_ref, ddof=1)
+ 
+    if not (np.isnan(res_std) or res_std == 0):
+        z_score[valid] = (residuals[valid] - res_mean) / res_std
+    else:
+        z_score[valid] = 0.0
+ 
+    # ---------- Robust median/MAD z-score ----------
+    # Statistics estimated from the reference (second training) segment
+    median_resid = np.nanmedian(valid_ref)
+    mad = np.nanmedian(np.abs(valid_ref - median_resid))
+ 
+    if np.isnan(mad) or mad == 0:
+        sigma_robust = res_std if not (np.isnan(res_std) or res_std == 0) else np.nan
+    else:
+        sigma_robust = 1.4826 * mad
+ 
+    if np.isnan(sigma_robust) or sigma_robust == 0:
+        z_score_robust[valid] = 0.0
+    else:
+        z_score_robust[valid] = (residuals[valid] - median_resid) / sigma_robust
+ 
+    return z_score, z_score_robust
+ 
+ 
+def build_results_df(df_predict, predictions, result,
+                     ref_residuals=None,
+                     threshold_z_score=3, threshold_z_score_robust=3):
+    """
+    Build a result DataFrame with anomaly scores (identical signature to UC model).
+ 
+    Parameters:
+    -----------
+    df_predict : pd.DataFrame
+        Prediction segment dataframe with 'Diff' and 'timestamp_utc' columns.
+    predictions : array-like
+        Predicted Diff values (may contain NaN).
+    result : dict
+        Result dictionary to store summary counts.
+    ref_residuals : array-like or None
+        Residuals from the second training segment used to estimate
+        thresholding statistics (mean, std, median, MAD). If None,
+        the prediction segment residuals are used instead (old behaviour).
+    threshold_z_score : int
+        Threshold for the classical z-score (default: 3).
+    threshold_z_score_robust : int
+        Threshold for the robust MAD-based score (default: 3).
+    """
+    actuals    = df_predict["Diff"].values.astype(float)
+    timestamps = df_predict["timestamp_utc"].values
+ 
+    if "is_anomaly" in df_predict.columns:
+        anomalies = np.asarray(df_predict["is_anomaly"].values)
+    else:
+        anomalies = None
+ 
+    timestamps  = pd.to_datetime(timestamps, utc=True)
+    actuals     = np.asarray(actuals)
+    predictions = np.asarray(predictions)
+    residuals   = np.abs(actuals - predictions)
+ 
+    result_df = pd.DataFrame({
+        "timestamp_utc": timestamps,
+        "actual":        actuals,
+        "predicted":     predictions,
+        "residual":      residuals,
+    })
+ 
+    if anomalies is not None:
+        # Scores are computed on prediction residuals, but thresholding statistics
+        # (mean, std, median, MAD) are estimated from ref_residuals (second training segment)
+        z_score, z_score_robust = compute_z_scores(residuals, ref_residuals=ref_residuals)
+        result_df["z_score"]        = z_score
+        result_df["z_score_robust"] = z_score_robust
+        result_df["is_anomaly_actual"] = anomalies
+ 
+        result_df["is_anomaly_predicted"] = (
+            np.abs(result_df["z_score"]) > threshold_z_score
+        ).astype(int)
+        result_df["is_anomaly_robust_predicted"] = (
+            np.abs(result_df["z_score_robust"]) > threshold_z_score_robust
+        ).astype(int)
+ 
+        result["number_of_anomalies"]        = int(result_df["is_anomaly_predicted"].sum())
+        result["number_of_anomalies_robust"] = int(result_df["is_anomaly_robust_predicted"].sum())
+        result["anomaly_indices"]        = result_df.index[result_df["is_anomaly_predicted"] == 1].tolist()
+        result["anomaly_indices_robust"] = result_df.index[result_df["is_anomaly_robust_predicted"] == 1].tolist()
+ 
+    return result_df
+ 
+ 
+# ============================================================================
+# SEASONAL PERIOD HELPER  (identical to UC model)
+# ============================================================================
+ 
+def calculate_seasonal_period(periodicity_seconds: float,
+                              seasonal_cycle: str = "daily") -> int:
+    if isinstance(seasonal_cycle, str):
+        if seasonal_cycle.lower() == "daily":
+            cycle_seconds = 24 * 3600
+        elif seasonal_cycle.lower() == "weekly":
+            cycle_seconds = 7 * 24 * 3600
+        else:
+            try:
+                cycle_seconds = float(seasonal_cycle)
+            except ValueError:
+                cycle_seconds = 24 * 3600
+    else:
+        cycle_seconds = float(seasonal_cycle)
+    return int(np.round(cycle_seconds / periodicity_seconds))
+ 
+ 
+# ============================================================================
+# SLIDING-WINDOW SPLIT  (identical logic to UC model)
+# ============================================================================
+ 
+def split_df_sliding_weeks(
+    df_raw,
+    seed,
+    result,
+    total_weeks: int = 6,
+    min_days_with_data_per_day: int = 1,
+    min_periodicity_month_train: int = 20,
+):
+    """
+    Identical sliding-window logic to the UC model:
+      - Random 6-week window (seeded by meter filename integer)
+      - Weeks 1–4  → df_train
+      - Weeks 2–5  → df_second  (warm-start)
+      - Week 6     → df_predict
+    """
+    df = df_raw.copy()
+    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+    df = df.sort_values("timestamp_utc").reset_index(drop=True)
+ 
+    min_ts = df["timestamp_utc"].min()
+    max_ts = df["timestamp_utc"].max()
+ 
+    total_days_required = 7 * total_weeks
+    if max_ts - min_ts < pd.Timedelta(days=total_days_required):
+        raise ValueError(
+            f"Not enough data. Need at least {total_days_required} days "
+            f"of data to form a {total_weeks}-week window."
+        )
+ 
+    df["date"] = df["timestamp_utc"].dt.floor("D")
+    daily_counts = df.groupby("date").size().rename("count").reset_index()
+ 
+    def window_has_no_big_gaps(start_ts, end_ts):
+        window_days = pd.date_range(
+            start=start_ts.floor("D"),
+            end=(end_ts - pd.Timedelta(seconds=1)).floor("D"),
+            freq="D",
+        )
+        df_counts_window = daily_counts[
+            (daily_counts["date"] >= window_days.min())
+            & (daily_counts["date"] <= window_days.max())
+        ]
+        df_counts_full = (
+            pd.DataFrame({"date": window_days})
+            .merge(df_counts_window, on="date", how="left")
+            .fillna({"count": 0})
+        )
+        return (df_counts_full["count"] >= min_days_with_data_per_day).all()
+ 
+    rng = default_rng(seed)
+    max_start  = max_ts - pd.Timedelta(days=total_days_required)
+    max_tries  = 30
+    chosen_start = None
+ 
+    for _ in range(max_tries):
+        u = rng.random()
+        rand_start = min_ts + (max_start - min_ts) * u
+        rand_start = pd.to_datetime(rand_start).floor("D")
+        rand_end   = rand_start + pd.Timedelta(days=total_days_required)
+ 
+        if rand_end > max_ts:
+            continue
+        if window_has_no_big_gaps(rand_start, rand_end):
+            chosen_start = rand_start
+            break
+ 
+    if chosen_start is None:
+        raise ValueError(
+            f"Could not find a {total_weeks}-week window with at least one "
+            f"measurement per day after {max_tries} tries."
+        )
+ 
+    chosen_end = chosen_start + pd.Timedelta(days=total_days_required)
+ 
+    df_6w = df[
+        (df["timestamp_utc"] >= chosen_start)
+        & (df["timestamp_utc"] < chosen_end)
+    ].copy().reset_index(drop=True)
+ 
+    periodicity_seconds = get_periodicity(df_6w)
+    result["df_samples"] = len(df_6w)
+    result["periodicity_seconds"] = periodicity_seconds
+ 
+    if periodicity_seconds == 0:
+        raise ValueError("Periodicity is equal to 0")
+ 
+    seasonal_period_steps = calculate_seasonal_period(periodicity_seconds)
+    result["seasonal_period_steps"] = seasonal_period_steps
+ 
+    # Adjust training length for high-frequency meters (same rule as UC)
+    weeks_train = 4
+    if periodicity_seconds < min_periodicity_month_train * 60:
+        weeks_train = 2
+ 
+    # Slice boundaries  (same as UC model)
+    start_pred   = chosen_end - pd.Timedelta(weeks=1)
+    end_pred     = chosen_end
+ 
+    start_second = start_pred   - pd.Timedelta(weeks=weeks_train)
+    end_second   = start_pred
+ 
+    start_train  = start_second - pd.Timedelta(weeks=1)
+    end_train    = end_second   - pd.Timedelta(weeks=1)
+ 
+    if start_train < chosen_start:
+        raise ValueError(
+            f"Chosen 6-week segment starts on {chosen_start} but initial "
+            f"train wants to start earlier at {start_train}"
+        )
+ 
+    df_train = df_6w[
+        (df_6w["timestamp_utc"] >= start_train)
+        & (df_6w["timestamp_utc"] < end_train)
+    ].copy().reset_index(drop=True)
+ 
+    df_second = df_6w[
+        (df_6w["timestamp_utc"] >= start_second)
+        & (df_6w["timestamp_utc"] < end_second)
+    ].copy().reset_index(drop=True)
+ 
+    df_predict = df_6w[
+        (df_6w["timestamp_utc"] >= start_pred)
+        & (df_6w["timestamp_utc"] < end_pred)
+    ].copy().reset_index(drop=True)
+ 
+    result["train_samples"]          = len(df_train)
+    result["second_train_samples"]   = len(df_second)
+    result["predict_samples"]        = len(df_predict)
+    result["train_predict_window_days"] = total_days_required
+ 
+    if len(df_train) < 2 or len(df_second) < 2 or len(df_predict) < 2:
+        raise ValueError(
+            "Insufficient data in one of the 6-week subsegments "
+            "(train/second/predict) for modeling."
+        )
+ 
+    return df_train, df_second, df_predict
+ 
+ 
+# ============================================================================
+# GRU MODEL
+# ============================================================================
+ 
 class GRUNet(nn.Module):
     """
-    GRU Network for Time Series Prediction (Sequence-to-Point)
-
-    Predicts the next consumption value (X_t) given a sequence of historical values.
-
-    Input features:
-    - Meter reading (normalized)
-    - Delta time since last reading (normalized)
-    - Time of day harmonics: sin(2π*hour/24), cos(2π*hour/24)
-    - Day of week harmonics: sin(2π*day/7), cos(2π*day/7)
-
-    Total input size: 6 features
-
-    Output:
-    - Single predicted value for next timestamp
+    GRU sequence-to-point model.
+    Input features per timestep (6 total):
+      Diff_norm, time_delta_norm, sin_tod, cos_tod, sin_dow, cos_dow
     """
-
+ 
     def __init__(self, input_size=6, hidden_size=32, num_layers=1, dropout=0.1):
-        super(GRUNet, self).__init__()
-        self.input_size = input_size
-        self.hidden_size = hidden_size
-        self.num_layers = num_layers
-
+        super().__init__()
         self.gru = nn.GRU(
             input_size=input_size,
             hidden_size=hidden_size,
@@ -125,692 +414,330 @@ class GRUNet(nn.Module):
             dropout=dropout if num_layers > 1 else 0,
             batch_first=True,
         )
-
-        # Output single value prediction
         self.fc_out = nn.Linear(hidden_size, 1)
-
+ 
     def forward(self, x):
-        """
-        Args:
-            x: Input tensor (batch_size, seq_len, 6)
-
-        Returns:
-            output: Prediction (batch_size, 1) - predicts next value X_t
-        """
         gru_out, _ = self.gru(x)
-        # Use only last timestep's hidden state for prediction
-        # This captures all temporal information up to current time
-        last_hidden = gru_out[:, -1, :]
-        output = self.fc_out(last_hidden)
-        return output
-
-
+        return self.fc_out(gru_out[:, -1, :])
+ 
+ 
 # ============================================================================
-# DATASET CLASS
+# DATASET
 # ============================================================================
-
-
+ 
 class MeterDataset(Dataset):
     """
-    PyTorch Dataset for water meter time series with harmonic features.
-    
-    Returns:
-    - Input: sequence of features for positions [t-window_size:t]
-    - Target: scalar value to predict at position t
+    Sliding-window dataset.
+    Input : features for positions [t-window_size : t]
+    Target: scalar Diff_norm at position t
     """
-
-    def __init__(self, df, window_size, train=True, scaler=None):
-        """
-        Args:
-            df: DataFrame with columns ['timestamp_utc', 'Diff']
-            window_size: Number of consecutive readings per window
-            train: If True, compute scaler; if False, use provided scaler
-            scaler: StandardScaler object (required if train=False)
-        """
-        self.df = df.copy()
+ 
+    def __init__(self, df: pd.DataFrame, window_size: int,
+                 train: bool = True, scaler: Optional[StandardScaler] = None):
         self.window_size = window_size
-
-        # Sort by timestamp
-        self.df["timestamp_utc"] = pd.to_datetime(self.df["timestamp_utc"], utc=True)
-        self.df = self.df.sort_values("timestamp_utc").reset_index(drop=True)
-
-        # Compute time deltas (in hours)
-        self.df["time_delta"] = (
-            self.df["timestamp_utc"].diff().dt.total_seconds() / 3600.0
-        )
-        self.df["time_delta"].fillna(0, inplace=True)
-
-        # Handle missing values
-        # self.df["is_missing"] = self.df["Diff"].isna().astype(float)
-        # self.df["Diff"].fillna(method="ffill", inplace=True)
-        # self.df["Diff"].fillna(0, inplace=True)
-
-        # Normalize meter readings
+        df = df.copy()
+        df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
+        df = df.sort_values("timestamp_utc").reset_index(drop=True)
+ 
+        # Fill NaN Diff with forward-fill then 0 (GRU can't handle NaN inputs)
+        df["Diff"] = df["Diff"].fillna(method="ffill").fillna(0.0)
+ 
+        # Time delta (hours)
+        df["time_delta"] = df["timestamp_utc"].diff().dt.total_seconds() / 3600.0
+        df["time_delta"].fillna(0, inplace=True)
+        df["time_delta_norm"] = np.clip(df["time_delta"], 0, 24) / 24.0
+ 
+        # Normalise consumption
         if train:
             self.scaler = StandardScaler()
-            self.df["Diff_norm"] = self.scaler.fit_transform(self.df[["Diff"]])
+            df["Diff_norm"] = self.scaler.fit_transform(df[["Diff"]])
         else:
-            assert scaler is not None, "Must provide scaler if train=False"
+            assert scaler is not None, "Must provide scaler when train=False"
             self.scaler = scaler
-            self.df["Diff_norm"] = self.scaler.transform(self.df[["Diff"]])
-
-        # Normalize time delta: cap at 24 hours
-        self.df["time_delta_capped"] = np.clip(self.df["time_delta"], 0, 24)
-        self.df["time_delta_norm"] = self.df["time_delta_capped"] / 24.0
-
-        # Compute harmonic features
-        hours = (
-            self.df["timestamp_utc"].dt.hour
-            + self.df["timestamp_utc"].dt.minute / 60.0
-        )
-        self.df["sin_tod"] = np.sin(2 * np.pi * hours / 24.0)
-        self.df["cos_tod"] = np.cos(2 * np.pi * hours / 24.0)
-
-        dow = self.df["timestamp_utc"].dt.dayofweek
-        self.df["sin_dow"] = np.sin(2 * np.pi * dow / 7.0)
-        self.df["cos_dow"] = np.cos(2 * np.pi * dow / 7.0)
-
-        self.max_idx = len(self.df) - self.window_size
-
+            df["Diff_norm"] = self.scaler.transform(df[["Diff"]])
+ 
+        # Harmonic time features
+        hours = df["timestamp_utc"].dt.hour + df["timestamp_utc"].dt.minute / 60.0
+        df["sin_tod"] = np.sin(2 * np.pi * hours / 24.0)
+        df["cos_tod"] = np.cos(2 * np.pi * hours / 24.0)
+        dow = df["timestamp_utc"].dt.dayofweek
+        df["sin_dow"] = np.sin(2 * np.pi * dow / 7.0)
+        df["cos_dow"] = np.cos(2 * np.pi * dow / 7.0)
+ 
+        self.df      = df
+        self.max_idx = len(df) - window_size
+ 
     def __len__(self):
         return max(1, self.max_idx)
-
+ 
     def __getitem__(self, idx):
-        """
-        Returns a window of historical data and the next value to predict.
-        
-        Input: X[idx:idx+window_size] - sequence of features
-        Target: X[idx+window_size-1] - the value at the end of window (what we predict)
-        """
         idx = min(idx, self.max_idx)
-        start_idx = idx
-        end_idx = idx + self.window_size
-
-        window = self.df.iloc[start_idx:end_idx]
-
-        # Input features for all timesteps in window
-        x = torch.stack(
-            [
-                torch.tensor(window["Diff_norm"].values, dtype=torch.float32),
-                torch.tensor(window["time_delta_norm"].values, dtype=torch.float32),
-                torch.tensor(window["sin_tod"].values, dtype=torch.float32),
-                torch.tensor(window["cos_tod"].values, dtype=torch.float32),
-                torch.tensor(window["sin_dow"].values, dtype=torch.float32),
-                torch.tensor(window["cos_dow"].values, dtype=torch.float32),
-            ],
-            dim=1,
-        )
-
-        # Target: SCALAR value at the last position (what we want to predict)
-        target_value = torch.tensor(
-            window["Diff_norm"].values[-1], dtype=torch.float32
-        )
-
-        return x, target_value
-
-
+        w = self.df.iloc[idx : idx + self.window_size]
+        x = torch.stack([
+            torch.tensor(w["Diff_norm"].values,       dtype=torch.float32),
+            torch.tensor(w["time_delta_norm"].values, dtype=torch.float32),
+            torch.tensor(w["sin_tod"].values,         dtype=torch.float32),
+            torch.tensor(w["cos_tod"].values,         dtype=torch.float32),
+            torch.tensor(w["sin_dow"].values,         dtype=torch.float32),
+            torch.tensor(w["cos_dow"].values,         dtype=torch.float32),
+        ], dim=1)
+        target = torch.tensor(w["Diff_norm"].values[-1], dtype=torch.float32)
+        return x, target
+ 
+ 
 # ============================================================================
-# TRAINING FUNCTIONS
+# TRAINING
 # ============================================================================
-
-
-def train_gru_model(
-    df,
-    window_size,
-    model_path=None,
-    epochs=5,
-    batch_size=32,
-    hidden_size=32,
-    learning_rate=1e-3,
-    loss_function="mae",
-    device=None,
-    pretrained_model_path=None,
-    verbose=False,
+ 
+def train_gru(
+    df: pd.DataFrame,
+    window_size: int,
+    model_path: Optional[str] = None,
+    epochs: int = 10,
+    batch_size: int = 32,
+    hidden_size: int = 32,
+    learning_rate: float = 1e-3,
+    device: Optional[torch.device] = None,
+    pretrained_model_path: Optional[str] = None,
+    scaler: Optional[StandardScaler] = None,
+    verbose: bool = False,
 ):
     """
-    Train a GRU model on a single meter's data with harmonic features.
-    
-    Model predicts next consumption value from historical sequence.
+    Train (or warm-start) a GRU model.
+ 
+    Parameters
+    ----------
+    pretrained_model_path : str, optional
+        If given, load weights from this checkpoint before training (warm-start).
+    scaler : StandardScaler, optional
+        Provide the scaler fitted on training data so the warm-start dataset
+        is normalised consistently.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+ 
     is_warmstart = pretrained_model_path is not None
-
-    if verbose:
-        logger.info(
-            f"Device: {device}, Dataset size: {len(df)}, Window size: {window_size}"
-        )
-
-    # Create dataset and dataloader
-    dataset = MeterDataset(df, window_size=window_size, train=True)
+ 
+    # Dataset – use existing scaler if doing warm-start, otherwise fit new one
+    dataset    = MeterDataset(df, window_size=window_size,
+                              train=(scaler is None), scaler=scaler)
     dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
-
-    scaler = dataset.scaler
-
-    # Initialize model
+    scaler_out = dataset.scaler
+ 
     model = GRUNet(input_size=6, hidden_size=hidden_size, num_layers=1, dropout=0.1)
     model = model.to(device)
-
-    # Load pretrained weights if provided
+ 
     if is_warmstart:
         try:
-            checkpoint = torch.load(
-                pretrained_model_path, map_location=device, weights_only=False
-            )
+            ckpt = torch.load(pretrained_model_path, map_location=device,
+                              weights_only=False)
         except TypeError:
-            checkpoint = torch.load(pretrained_model_path, map_location=device)
-
-        model.load_state_dict(checkpoint["model_state_dict"])
-        if verbose:
-            logger.info(f"Loaded pretrained weights from {pretrained_model_path}")
-
-    # Loss function selection
-    if loss_function.lower() == "mae":
-        criterion = nn.L1Loss()
-    elif loss_function.lower() == "mse":
-        criterion = nn.MSELoss()
-    else:
-        raise ValueError(
-            f"loss_function must be 'mae' or 'mse', got '{loss_function}'"
-        )
-
+            ckpt = torch.load(pretrained_model_path, map_location=device)
+        model.load_state_dict(ckpt["model_state_dict"])
+ 
+    criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
-
-    if is_warmstart:
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=max(2, epochs // 2), gamma=0.7
-        )
-    else:
-        scheduler = torch.optim.lr_scheduler.StepLR(
-            optimizer, step_size=10, gamma=0.5
-        )
-
+ 
+    step = max(2, epochs // 2) if is_warmstart else 10
+    scheduler = torch.optim.lr_scheduler.StepLR(optimizer, step_size=step, gamma=0.5)
+ 
     losses = []
-
     for epoch in range(epochs):
-        epoch_loss = 0.0
-        num_batches = 0
-
         model.train()
-        for x, target_value in dataloader:
-            x = x.to(device)
-            target_value = target_value.to(device)
-
-            # Forward pass
-            output = model(x)  # shape: (batch_size, 1)
-            output = output.squeeze()  # shape: (batch_size,)
-
-            # Compute loss
-            loss = criterion(output, target_value)
-
-            # Backward pass
+        epoch_loss, n_batches = 0.0, 0
+        for x, y in dataloader:
+            x, y = x.to(device), y.to(device)
+            pred = model(x).squeeze()
+            loss = criterion(pred, y)
             optimizer.zero_grad()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
             optimizer.step()
-
             epoch_loss += loss.item()
-            num_batches += 1
-
-        avg_loss = epoch_loss / num_batches
-        losses.append(avg_loss)
+            n_batches  += 1
+        avg = epoch_loss / max(n_batches, 1)
+        losses.append(avg)
         scheduler.step()
-
         if verbose and ((epoch + 1) % max(1, epochs // 5) == 0 or epoch == 0):
-            logger.info(f"Epoch {epoch+1}/{epochs}, Loss: {avg_loss:.6f}")
-
-    # Save model if path provided
+            logger.info(f"  Epoch {epoch+1}/{epochs}  loss={avg:.6f}")
+ 
     if model_path:
-        torch.save(
-            {
-                "model_state_dict": model.state_dict(),
-                "scaler": scaler,
-                "hidden_size": hidden_size,
-                "window_size": window_size,
-                "is_warmstart": is_warmstart,
-            },
-            model_path,
-        )
-
-    return model, scaler, losses
-
-
-def load_gru_model(model_path, device=None):
-    """Load a previously trained GRU model"""
+        torch.save({
+            "model_state_dict": model.state_dict(),
+            "scaler":           scaler_out,
+            "hidden_size":      hidden_size,
+            "window_size":      window_size,
+        }, model_path)
+ 
+    return model, scaler_out, losses
+ 
+ 
+# ============================================================================
+# PREDICTION
+# ============================================================================
+ 
+def predict_with_gru(
+    model: GRUNet,
+    df_predict: pd.DataFrame,
+    scaler: StandardScaler,
+    window_size: int,
+    df_context: pd.DataFrame,
+    device: Optional[torch.device] = None,
+) -> np.ndarray:
+    """
+    Rolling-window prediction over df_predict.
+ 
+    To avoid NaN predictions at the start of the prediction window (which
+    would occur if window_size > len(df_predict)), we prepend the last
+    window_size rows of df_context as history.
+ 
+    Returns
+    -------
+    np.ndarray
+        Predicted values (unscaled), one per row of df_predict.
+    """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    try:
-        checkpoint = torch.load(model_path, map_location=device, weights_only=False)
-    except TypeError:
-        checkpoint = torch.load(model_path, map_location=device)
-
-    hidden_size = checkpoint["hidden_size"]
-    scaler = checkpoint["scaler"]
-    window_size = checkpoint.get("window_size", 48)
-
-    model = GRUNet(input_size=6, hidden_size=hidden_size, num_layers=1, dropout=0.1)
-    model.load_state_dict(checkpoint["model_state_dict"])
-    model = model.to(device)
+ 
+    # Build a combined frame: context tail + predict window
+    context_tail = df_context.iloc[-window_size:].copy()
+    combined = pd.concat([context_tail, df_predict], ignore_index=True)
+    combined["timestamp_utc"] = pd.to_datetime(combined["timestamp_utc"], utc=True)
+    combined = combined.sort_values("timestamp_utc").reset_index(drop=True)
+ 
+    # Fill NaNs
+    combined["Diff"] = combined["Diff"].fillna(method="ffill").fillna(0.0)
+ 
+    # Feature engineering
+    combined["time_delta"] = combined["timestamp_utc"].diff().dt.total_seconds() / 3600.0
+    combined["time_delta"].fillna(0, inplace=True)
+    combined["time_delta_norm"] = np.clip(combined["time_delta"], 0, 24) / 24.0
+    combined["Diff_norm"] = scaler.transform(combined[["Diff"]])
+    hours = combined["timestamp_utc"].dt.hour + combined["timestamp_utc"].dt.minute / 60.0
+    combined["sin_tod"] = np.sin(2 * np.pi * hours / 24.0)
+    combined["cos_tod"] = np.cos(2 * np.pi * hours / 24.0)
+    dow = combined["timestamp_utc"].dt.dayofweek
+    combined["sin_dow"] = np.sin(2 * np.pi * dow / 7.0)
+    combined["cos_dow"] = np.cos(2 * np.pi * dow / 7.0)
+ 
+    feature_cols = ["Diff_norm", "time_delta_norm", "sin_tod",
+                    "cos_tod", "sin_dow", "cos_dow"]
+ 
+    n_context = len(context_tail)
+    n_total   = len(combined)
+ 
+    predictions_norm = np.full(n_total, np.nan)
+ 
     model.eval()
-
-    return model, scaler, window_size
-
-
+    with torch.no_grad():
+        for t in range(window_size, n_total):
+            w = combined.iloc[t - window_size : t][feature_cols].values
+            X = torch.tensor(w, dtype=torch.float32).unsqueeze(0).to(device)
+            predictions_norm[t] = model(X).squeeze().cpu().numpy()
+ 
+    # Slice predictions to the prediction-window rows only
+    pred_norm_slice = predictions_norm[n_context:]
+ 
+    # Denormalise
+    predictions = scaler.inverse_transform(
+        pred_norm_slice.reshape(-1, 1)
+    ).flatten()
+ 
+    # Clip negatives (consumption can't be negative)
+    predictions = np.clip(predictions, 0.0, None)
+ 
+    return predictions
+ 
+ 
 # ============================================================================
-# PREDICTION FUNCTIONS
+# SINGLE-METER PROCESSING
 # ============================================================================
-
-
-def prepare_data_for_prediction(df, scaler):
-    """Prepare data with all features for prediction"""
-    test_df = df.copy()
-    test_df["timestamp_utc"] = pd.to_datetime(test_df["timestamp_utc"], utc=True)
-    test_df = test_df.dropna()
-
-    # Time delta
-    test_df["time_delta"] = (
-        test_df["timestamp_utc"].diff().dt.total_seconds() / 3600.0
-    )
-
-    test_df = test_df.dropna()
-    test_df["time_delta_capped"] = np.clip(test_df["time_delta"], 0, 24)
-    test_df["time_delta_norm"] = test_df["time_delta_capped"] / 24.0
-
-    # Normalize readings
-    test_df["Diff_norm"] = scaler.transform(test_df[["Diff"]])
-
-    # Harmonic features
-    hours = test_df["timestamp_utc"].dt.hour + test_df["timestamp_utc"].dt.minute / 60.0
-    test_df["sin_tod"] = np.sin(2 * np.pi * hours / 24.0)
-    test_df["cos_tod"] = np.cos(2 * np.pi * hours / 24.0)
-
-    dow = test_df["timestamp_utc"].dt.dayofweek
-    test_df["sin_dow"] = np.sin(2 * np.pi * dow / 7.0)
-    test_df["cos_dow"] = np.cos(2 * np.pi * dow / 7.0)
-
-    return test_df
-
-
-def predict_with_gru(model, df, scaler, window_size, device=None):
-    """
-    Generate predictions using rolling window approach.
-    
-    For each position t >= window_size:
-    - Use history [t-window_size:t] to predict value at t
-    - Compare prediction with actual value at t for anomaly detection
-    """
-    if device is None:
-        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    test_df = prepare_data_for_prediction(df, scaler)
-
-    n_samples = len(test_df)
-    predictions_norm = np.full(n_samples, np.nan)
-    
-    # Rolling window prediction
-    for t in range(window_size, n_samples):
-        # Get window [t-window_size:t]
-        window_data = test_df.iloc[t - window_size : t]
-
-        feature_list = [
-            window_data["Diff_norm"].values,
-            window_data["time_delta_norm"].values,
-            window_data["sin_tod"].values,
-            window_data["cos_tod"].values,
-            window_data["sin_dow"].values,
-            window_data["cos_dow"].values,
-        ]
-
-        X_window = np.stack(feature_list, axis=1)  # (window_size, 6)
-        X_tensor = torch.tensor(X_window, dtype=torch.float32).unsqueeze(0)
-        X_tensor = X_tensor.to(device)
-
-        model.eval()
-        with torch.no_grad():
-            pred = model(X_tensor)
-
-        predictions_norm[t] = pred.squeeze().cpu().numpy()
-        
-
-    # Cut window size to get rid of NaNs
-    actuals = test_df["Diff"].values[window_size:]
-    predictions_norm = predictions_norm[window_size:]
-    
-    # Denormalize
-    predictions = scaler.inverse_transform(predictions_norm.reshape(-1, 1)).flatten()
-
-    # Compute residuals
-    residuals = np.abs(actuals - predictions)
-
-    # Anomaly score: z-score of residuals
-    rolling_mean = pd.Series(residuals).rolling(window=24, center=True).mean()
-    rolling_std = pd.Series(residuals).rolling(window=24, center=True).std()
-
-    anomaly_score = (residuals - rolling_mean) / (rolling_std + 1e-6)
-
-    result_df = test_df[["timestamp_utc", "Diff"]].copy().iloc[window_size:]
-    result_df.columns = ["timestamp_utc", "actual"]
-    result_df["predicted"] = predictions
-    result_df["residual"] = residuals
-    result_df["anomaly_score"] = anomaly_score
-    result_df["is_anomaly"] = (np.abs(anomaly_score) > 4).astype(int)   
-
-    return result_df
-
-
-# ============================================================================
-# METRICS CALCULATION
-# ============================================================================
-
-
-def calculate_metrics(actuals, predictions, residuals):
-    """
-    Calculate comprehensive metrics for predictions, including both all-data
-    and non-zero-only metrics
-
-    Parameters:
-    -----------
-    actuals : array-like
-        Actual values
-    predictions : array-like
-        Predicted values
-    residuals : array-like
-        Residuals (actuals - predictions)
-
-    Returns:
-    --------
-    dict : Dictionary containing all metrics with suffixes for non-zero variants
-    """
-    metrics = {}
-    
-    # Create mask for non-zero actuals
-    non_zero_mask = actuals != 0
-    non_zero_count = np.sum(non_zero_mask)
-
-    # Store the count of zero and non-zero values for reference
-    metrics["total_count"] = len(actuals)
-    metrics["non_zero_count"] = non_zero_count
-    metrics["zero_count"] = len(actuals) - non_zero_count
-    metrics["non_zero_percentage"] = (
-        (non_zero_count / len(actuals)) * 100 if len(actuals) > 0 else 0
-    )
-
-    # ====================
-    # ALL DATA METRICS
-    # ====================
-
-    # Basic metrics
-    metrics["rmse"] = np.sqrt(mean_squared_error(actuals, predictions))
-    metrics["mae"] = mean_absolute_error(actuals, predictions)
-    metrics["r2"] = r2_score(actuals, predictions)
-
-    # MAPE (handle division by zero)
-    try:
-        metrics["mape"] = mean_absolute_percentage_error(actuals, predictions)
-    except Exception:
-        metrics["mape"] = np.nan
-
-    # Additional metrics
-    metrics["mean_residual"] = np.mean(residuals)
-    metrics["std_residual"] = np.std(residuals)
-    metrics["max_residual"] = np.max(residuals)
-    metrics["min_residual"] = np.min(residuals)
-
-    # RMSE normalized by actual variance
-    actual_var = np.var(actuals)
-    if actual_var > 0:
-        metrics["normalized_rmse"] = metrics["rmse"] / np.sqrt(actual_var)
-    else:
-        metrics["normalized_rmse"] = np.nan
-
-    # Median Absolute Percentage Error (robust to outliers)
-    try:
-        mape_values = np.abs((actuals - predictions) / (np.abs(actuals) + 1e-8))
-        metrics["median_ape"] = np.median(mape_values)
-    except Exception:
-        metrics["median_ape"] = np.nan
-
-    # Prediction bias
-    metrics["prediction_bias"] = np.mean(predictions - actuals)
-
-    # Direction accuracy (percentage of correct sign predictions)
-    actual_diff = np.diff(actuals)
-    pred_diff = np.diff(predictions)
-    if len(actual_diff) > 0:
-        direction_matches = np.sum((actual_diff > 0) == (pred_diff > 0))
-        metrics["direction_accuracy"] = direction_matches / len(actual_diff)
-    else:
-        metrics["direction_accuracy"] = np.nan
-
-    # ====================
-    # NON-ZERO ONLY METRICS
-    # ====================
-
-    if non_zero_count > 0:
-        # Filter data to non-zero actuals only
-        actuals_nz = actuals[non_zero_mask]
-        predictions_nz = predictions[non_zero_mask]
-        residuals_nz = residuals[non_zero_mask]
-
-        # Basic metrics for non-zero values
-        metrics["rmse_nz"] = np.sqrt(mean_squared_error(actuals_nz, predictions_nz))
-        metrics["mae_nz"] = mean_absolute_error(actuals_nz, predictions_nz)
-
-        # R2 for non-zero values
-        try:
-            metrics["r2_nz"] = r2_score(actuals_nz, predictions_nz)
-        except Exception:
-            metrics["r2_nz"] = np.nan
-
-        # MAPE for non-zero values (should work since we excluded zeros)
-        try:
-            metrics["mape_nz"] = mean_absolute_percentage_error(
-                actuals_nz, predictions_nz
-            )
-        except Exception:
-            metrics["mape_nz"] = np.nan
-
-        # Residual statistics for non-zero values
-        metrics["mean_residual_nz"] = np.mean(residuals_nz)
-        metrics["std_residual_nz"] = np.std(residuals_nz)
-        metrics["max_residual_nz"] = np.max(residuals_nz)
-        metrics["min_residual_nz"] = np.min(residuals_nz)
-
-        # RMSE normalized by actual variance (non-zero)
-        actual_var_nz = np.var(actuals_nz)
-        if actual_var_nz > 0:
-            metrics["normalized_rmse_nz"] = metrics["rmse_nz"] / np.sqrt(actual_var_nz)
-        else:
-            metrics["normalized_rmse_nz"] = np.nan
-
-        # Median Absolute Percentage Error for non-zero values
-        try:
-            mape_values_nz = np.abs((actuals_nz - predictions_nz) / np.abs(actuals_nz))
-            metrics["median_ape_nz"] = np.median(mape_values_nz)
-        except Exception:
-            metrics["median_ape_nz"] = np.nan
-
-        # Prediction bias for non-zero values
-        metrics["prediction_bias_nz"] = np.mean(predictions_nz - actuals_nz)
-
-        # Direction accuracy for non-zero values
-        if len(actuals_nz) > 1:
-            actual_diff_nz = np.diff(actuals_nz)
-            pred_diff_nz = np.diff(predictions_nz)
-            if len(actual_diff_nz) > 0:
-                direction_matches_nz = np.sum(
-                    (actual_diff_nz > 0) == (pred_diff_nz > 0)
-                )
-                metrics["direction_accuracy_nz"] = direction_matches_nz / len(
-                    actual_diff_nz
-                )
-            else:
-                metrics["direction_accuracy_nz"] = np.nan
-        else:
-            metrics["direction_accuracy_nz"] = np.nan
-
-    else:
-        # If no non-zero values exist, set all non-zero metrics to NaN
-        metrics["rmse_nz"] = np.nan
-        metrics["mae_nz"] = np.nan
-        metrics["r2_nz"] = np.nan
-        metrics["mape_nz"] = np.nan
-        metrics["mean_residual_nz"] = np.nan
-        metrics["std_residual_nz"] = np.nan
-        metrics["max_residual_nz"] = np.nan
-        metrics["min_residual_nz"] = np.nan
-        metrics["normalized_rmse_nz"] = np.nan
-        metrics["median_ape_nz"] = np.nan
-        metrics["prediction_bias_nz"] = np.nan
-        metrics["direction_accuracy_nz"] = np.nan
-
-    return metrics
-
-
-# ============================================================================
-# MAIN PROCESSING FUNCTION
-# ============================================================================
-
-
-def get_periodicity(df: pd.DataFrame, timestamp_col: str = "timestamp_utc") -> int:
-    """
-    Calculate the most common periodicity (time between readings) in seconds.
-
-    Returns:
-    --------
-    int
-        Most common periodicity in seconds
-    """
-    df[timestamp_col] = pd.to_datetime(df[timestamp_col], utc=True)
-
-    time_diffs = df[timestamp_col].diff().dropna().dt.total_seconds()
-
-    if time_diffs.empty:
-        raise ValueError("No time difference calculated.")
-
-    common_periodicity_mode = time_diffs.mode()
-    return common_periodicity_mode.iloc[0]
-
-
+ 
 def process_single_meter(
     csv_filepath: str,
-    temp_dir: str = "./temp_models",
     device: Optional[torch.device] = None,
-    epochs_train: int = 20,
+    epochs_train: int = 10,
     epochs_warmstart: int = 5,
     verbose: bool = False,
-    predictions_output_csv: Optional[str] = None
+    predictions_output_csv: Optional[str] = None,
+    threshold_z_score: int = 3,
+    threshold_z_score_robust: int = 3,
+    temp_dir: str = "./temp_models_gru",
 ) -> Dict:
     """
-    Process a single water meter CSV file through training and prediction pipeline
+    Process one water meter CSV through the sliding-window GRU pipeline.
+ 
+    The split, seed, resampling, and metrics are identical to the UC model
+    so that results are directly comparable.
+ 
+    Anomaly scoring:
+    - Thresholding statistics (mean, std, median, MAD) are estimated from the
+      second training segment residuals and then applied to score the prediction
+      segment residuals, so that the calibration window is anomaly-free.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+ 
     result = {
         "filename": Path(csv_filepath).stem,
         "filepath": csv_filepath,
-        "status": "processing",
-        "error": None,
+        "status":   "processing",
+        "error":    None,
     }
-
+ 
     try:
         if verbose:
             logger.info(f"Processing {result['filename']}...")
-
-        df = pd.read_csv(csv_filepath)
-
-        # Handle column name variations
-        if "timestamp_utc" not in df.columns:
-            raise ValueError(
-                f"No timestamp_utc column found. Available: {df.columns.tolist()}"
-            )
-
-        if "Diff" not in df.columns:
-            raise ValueError(f"No 'Diff' column found. Available: {df.columns.tolist()}")
-
-        df = df[["timestamp_utc", "Diff"]].copy()
-        df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
-        df = df.dropna()
-
-        # ===== SPLIT INTO 3 CHUNKS (3–2m, 2–1m, 1m) =====
-        end = df.loc[df.index[-1], "timestamp_utc"]
-
-        start_pred = end - DateOffset(months=1)
-        start_warmstart = start_pred - DateOffset(months=1)
-        start_train = start_warmstart - DateOffset(months=1)
-
-        if start_train < df.loc[0, "timestamp_utc"]:
-            raise ValueError(
-                f"Not enough data. Start time needed for train {start_train}, "
-                f"but earliest possible is {df['timestamp_utc'].iloc[0]}"
-            )
-
-        mask = (df["timestamp_utc"] >= start_pred) & (df["timestamp_utc"] < end)
-        df_predict = df.loc[mask].copy().reset_index()
-        mask = (df["timestamp_utc"] >= start_warmstart) & (
-            df["timestamp_utc"] < start_pred
+ 
+        df_raw = pd.read_csv(csv_filepath)
+ 
+        if "timestamp_utc" not in df_raw.columns:
+            raise ValueError(f"No timestamp_utc column. Available: {df_raw.columns.tolist()}")
+        if "hodnota" not in df_raw.columns:
+            raise ValueError(f"No 'hodnota' column. Available: {df_raw.columns.tolist()}")
+        if len(df_raw) < 2:
+            raise ValueError("DataFrame too short (len < 2)")
+ 
+        df_raw["timestamp_utc"] = pd.to_datetime(df_raw["timestamp_utc"], utc=True)
+        df_raw.dropna(subset=["timestamp_utc"], inplace=True)
+ 
+        # ===================================================================
+        # SPLIT  – identical seed / logic to UC model
+        # ===================================================================
+        seed = int(result["filename"])
+        df_train, df_second, df_predict = split_df_sliding_weeks(
+            df_raw=df_raw, seed=seed, result=result
         )
-        df_warmstart = df.loc[mask].copy().reset_index()
-        mask = (df["timestamp_utc"] >= start_train) & (
-            df["timestamp_utc"] < start_warmstart
-        )
-        df_train = df.loc[mask].copy().reset_index()
-
-        result["train_samples"] = len(df_train)
-        result["second_train_samples"] = len(df_warmstart)
-        result["predict_samples"] = len(df_predict)
-
+ 
+        seasonal_period_steps = result["seasonal_period_steps"]
+        if seasonal_period_steps < 2:
+            raise ValueError("Seasonal period steps < 2.")
+ 
+        # Use one daily cycle as the GRU sequence window (same as UC's seasonal period)
+        window_size = seasonal_period_steps
+        result["window_size"] = window_size
+ 
+        if len(df_train) < window_size or len(df_second) < window_size or len(df_predict) < window_size:
+            raise ValueError(
+                f"A data split has fewer rows ({len(df_train)}, {len(df_second)}, "
+                f"{len(df_predict)}) than window_size ({window_size})."
+            )
+ 
         if verbose:
             logger.info(
-                f"  Train: {len(df_train)}, Warmstart: {len(df_warmstart)}, Predict: {len(df_predict)}"
+                f"  window_size={window_size}, train={len(df_train)}, "
+                f"second={len(df_second)}, predict={len(df_predict)}"
             )
-
-        # ===== GET WINDOW SIZES =====
-        periodicity_seconds_train = get_periodicity(df_train)
-        periodicity_seconds_warmstart = get_periodicity(df_warmstart)
-        periodicity_seconds_predict = get_periodicity(df_predict)
-
-        window_size_train = int(round(24 * 60 * 60 / periodicity_seconds_train))
-        window_size_warmstart = int(
-            round(24 * 60 * 60 / periodicity_seconds_warmstart)
-        )
-        window_size_predict = int(round(24 * 60 * 60 / periodicity_seconds_predict))
-
-        if not (
-            window_size_train
-            == window_size_warmstart
-            == window_size_predict
-        ):
-            raise ValueError(
-                f"Window sizes of Train ({window_size_train}), Warmup ({window_size_warmstart}) "
-                f"and Predict ({window_size_predict}) dataset do not equal."
-            )
-
-        window_size = window_size_train
-        result["window_size"] = window_size
-
-        if (
-            len(df_train) < window_size
-            or len(df_warmstart) < window_size
-            or len(df_predict) < window_size
-        ):
-            raise ValueError(
-                f"Insufficient amount of training data. Training data is smaller than window size {window_size}"
-            )
-
-        # ===== TRAINING PHASE =====
-        temp_model_path = os.path.join(temp_dir, f"{result['filename']}_initial.pt")
+ 
         os.makedirs(temp_dir, exist_ok=True)
-
-        if verbose:
-            logger.info(f"  Training on {len(df_train)} samples ({epochs_train} epochs)...")
-
-        # --- measure initial training time ---
-        t_start_train = time.time()
-        model, scaler, losses_train = train_gru_model(
+        temp_model_path      = os.path.join(temp_dir, f"{result['filename']}_initial.pt")
+        warmstart_model_path = os.path.join(temp_dir, f"{result['filename']}_warmstart.pt")
+ 
+        # ===================================================================
+        # INITIAL TRAINING
+        # ===================================================================
+        t0 = time.time()
+        model, scaler, losses_train = train_gru(
             df_train,
             window_size=window_size,
             model_path=temp_model_path,
@@ -818,261 +745,484 @@ def process_single_meter(
             batch_size=32,
             hidden_size=32,
             learning_rate=1e-3,
-            loss_function="mae",
             device=device,
             verbose=verbose,
         )
-        t_end_train = time.time()
-        result["train_time_seconds"] = t_end_train - t_start_train
-        # --------------------------------------
-
-        result["train_final_loss"] = losses_train[-1] if losses_train else None
-
-        # ===== WARM-START PHASE =====
-        warmstart_model_path = os.path.join(
-            temp_dir, f"{result['filename']}_warmstart.pt"
-        )
-
+        result["train_train_time_seconds"] = time.time() - t0
+        result["train_final_loss"]         = losses_train[-1] if losses_train else None
+ 
         if verbose:
-            logger.info(
-                f"  Warm-start retraining on {len(df_warmstart)} samples ({epochs_warmstart} epochs)..."
-            )
-
-        # --- measure warm-start training time ---
-        t_start_warm = time.time()
-        model, scaler, losses_warmstart = train_gru_model(
-            df_warmstart,
+            logger.info(f"  Initial training done.")
+ 
+        # ===================================================================
+        # WARM-START (second training)
+        # ===================================================================
+        t0 = time.time()
+        model, scaler, losses_warmstart = train_gru(
+            df_second,
             window_size=window_size,
             model_path=warmstart_model_path,
             epochs=epochs_warmstart,
             batch_size=32,
             hidden_size=32,
             learning_rate=5e-4,
-            loss_function="mae",
             device=device,
             pretrained_model_path=temp_model_path,
+            scaler=scaler,          # keep the same scaler from initial training
             verbose=verbose,
         )
-        t_end_warm = time.time()
-        result["warmstart_time_seconds"] = t_end_warm - t_start_warm
-        # -----------------------------------------
-
-        result["warmstart_final_loss"] = (
-            losses_warmstart[-1] if losses_warmstart else None
-        )
-
-        # ===== PREDICTION PHASE =====
+        result["second_train_time_seconds"] = time.time() - t0
+        result["warmstart_final_loss"]      = losses_warmstart[-1] if losses_warmstart else None
+ 
         if verbose:
-            logger.info(f"  Generating predictions on {len(df_predict)} samples...")
-
-        # --- measure prediction time ---
-        t_start_pred = time.time()
-        predictions_df = predict_with_gru(
-            model, df_predict, scaler, window_size=window_size, device=device
+            logger.info(f"  Warm-start done.")
+ 
+        # ===================================================================
+        # COMPUTE REFERENCE RESIDUALS FROM SECOND TRAINING SEGMENT
+        # These residuals are used to estimate thresholding statistics
+        # (mean, std, median, MAD) for anomaly scoring, ensuring the
+        # calibration window is anomaly-free.
+        # df_train is used as context (mirrors UC's init_second_mean/cov,
+        # which carried state from the end of initial training into df_second).
+        # ===================================================================
+        if verbose:
+            logger.info(f"  Computing reference residuals from second training segment...")
+ 
+        t0 = time.time()
+        second_predictions = predict_with_gru(
+            model=model,
+            df_predict=df_second,
+            scaler=scaler,
+            window_size=window_size,
+            df_context=df_train,   # initial training segment provides history
+            device=device,
         )
-        t_end_pred = time.time()
-        result["prediction_time_seconds"] = t_end_pred - t_start_pred
-        
+        result["second_prediction_time_seconds"] = time.time() - t0
+ 
+        second_actuals  = df_second["Diff"].values.astype(float)
+        second_residuals = np.abs(second_actuals - second_predictions)
+ 
+        if verbose:
+            logger.info(f"  Reference residuals computed.")
+ 
+        # ===================================================================
+        # INJECT ANOMALIES INTO PREDICTION SEGMENT
+        # Injection happens after all training and after reference residuals
+        # are computed, so model parameters and thresholding statistics are
+        # not affected by the injected anomalies.
+        # ===================================================================
+        df_predict = inject_spike_anomalies_diff(df_predict, random_state=int(result["filename"]))
+ 
+        if verbose:
+            logger.info(f"  Anomalies injected.")
+ 
+        # ===================================================================
+        # PREDICTION
+        # ===================================================================
+        # df_second is used as context so the first prediction timestep has
+        # a full window of history (mirrors UC's state carry-over).
+        t0 = time.time()
+        predictions = predict_with_gru(
+            model=model,
+            df_predict=df_predict,
+            scaler=scaler,
+            window_size=window_size,
+            df_context=df_second,
+            device=device,
+        )
+        result["prediction_time_seconds"] = time.time() - t0
+ 
+        if verbose:
+            logger.info(f"  Prediction done.")
+ 
+        # ===================================================================
+        # BUILD RESULTS DATAFRAME  (same helper as UC model)
+        # Scores applied to prediction residuals, statistics estimated from
+        # second training segment residuals.
+        # ===================================================================
+        predictions_df = build_results_df(
+            df_predict, predictions, result,
+            ref_residuals=second_residuals,
+            threshold_z_score=threshold_z_score,
+            threshold_z_score_robust=threshold_z_score_robust,
+        )
+ 
         if predictions_output_csv is not None:
             predictions_df.to_csv(predictions_output_csv, index=False)
-        # --------------------------------
-
-        # ===== CALCULATE METRICS =====
-        if verbose:
-            logger.info(f"  Calculating metrics...")
-            
-        actuals = predictions_df["actual"].values
-        preds = predictions_df["predicted"].values
-        residuals = predictions_df["residual"].values
-
-        metrics = calculate_metrics(actuals, preds, residuals)
-
-        # Add metrics to result
+ 
+        # ===================================================================
+        # METRICS  (same functions as UC model)
+        # ===================================================================
+        if len(predictions_df) < 2:
+            raise ValueError(
+                "Less than 2 data points in one of the prediction dfs "
+                "for metric calculation."
+            )
+ 
+        metrics = calculate_metrics(predictions_df)
         for key, value in metrics.items():
             result[f"metric_{key}"] = value
-
-        result["anomalies_detected"] = int(predictions_df["is_anomaly"].sum())
+ 
         result["status"] = "success"
-
-        # Always show per-file success summary line
+        result['converged_train'] = True
+        result['converged_second'] = True
+        
         if verbose:
             logger.info(
-                f"Processed successfully: {result['filename']} - RMSE: {metrics['rmse']}, "
-                f"MAE: {metrics['mae']}, R2: {metrics['r2']}"
+                f"Processed successfully (GRU): {result['filename']} - "
+                f"RMSE: {metrics['rmse']:.4f}, "
+                f"MAE: {metrics['mae']:.4f}, "
+                f"R2: {metrics['r2']:.4f}"
             )
-
-        # ===== CLEANUP =====
-        if os.path.exists(temp_model_path):
-            os.remove(temp_model_path)
-        if os.path.exists(warmstart_model_path):
-            os.remove(warmstart_model_path)
-
+ 
+        # Cleanup temp files
+        for p in [temp_model_path, warmstart_model_path]:
+            if os.path.exists(p):
+                os.remove(p)
+ 
         return result
-
+ 
     except Exception as e:
         result["status"] = "failed"
-        result["error"] = str(e)
-        # Always show per-file failure line
+        result["error"]  = str(e)
         logger.error(f"Failed: {result['filename']} - Error: {e}")
         if verbose:
             logger.debug(traceback.format_exc())
         return result
-
-
-# ============================================================================
-# BATCH PROCESSING WITH MULTITHREADING
-# ============================================================================
-
-
-def process_batch(
+    
+    
+from multiprocessing import Process, Queue
+from collections import deque
+import queue as py_queue
+import time
+from pathlib import Path
+from typing import List
+from tqdm import tqdm
+import pandas as pd
+import torch
+ 
+ 
+def worker(
+    csv_path: str,
+    result_queue: Queue,
+    epochs_train: int,
+    epochs_warmstart: int,
+    verbose: bool,
+):
+    filename = Path(csv_path).stem
+ 
+    try:
+        result = process_single_meter(
+            csv_path,
+            device=None,   # each child creates its own device
+            epochs_train=epochs_train,
+            epochs_warmstart=epochs_warmstart,
+            verbose=verbose,
+        )
+    except Exception as e:
+        result = {
+            "filename": filename,
+            "filepath": csv_path,
+            "status": "failed",
+            "error": str(e),
+        }
+ 
+    result_queue.put(result)
+ 
+ 
+def process_batch_manual(
     csv_filepaths: List[str],
     output_csv: str,
-    num_workers: int = 4,
-    epochs_train: int = 20,
+    num_workers: int = 7,
+    epochs_train: int = 5,
     epochs_warmstart: int = 5,
     verbose: bool = False,
+    per_file_timeout: int = 300,
 ):
     """
-    Process multiple water meter CSV files in parallel
+    Process multiple meter files in parallel using manual multiprocessing.Process
+    workers with hard per-file termination on timeout.
+ 
+    Windows-friendly approach:
+      - at most `num_workers` child processes alive at once
+      - each file gets its own child process
+      - timed-out child is terminated and replaced by a new one
     """
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if verbose:
         logger.info(f"Using device: {device}")
         logger.info(f"Processing {len(csv_filepaths)} files with {num_workers} workers")
-
+        logger.info(f"Per-file timeout: {per_file_timeout} seconds")
+ 
+    pending = deque(csv_filepaths)
+    active = []
     all_results = []
-
-    with ThreadPoolExecutor(max_workers=num_workers) as executor:
+    result_queue = Queue()
+ 
+    success_count = 0
+    failed_count = 0
+    timeout_count = 0
+    processed_count = 0
+    total_files = len(csv_filepaths)
+ 
+    with tqdm(total=total_files, desc="Processing meters", unit="file") as pbar:
+        while pending or active:
+            # Fill free worker slots
+            while pending and len(active) < num_workers:
+                filepath = pending.popleft()
+                p = Process(
+                    target=worker,
+                    args=(filepath, result_queue, epochs_train, epochs_warmstart, verbose),
+                )
+                p.start()
+ 
+                active.append({
+                    "proc": p,
+                    "file": filepath,
+                    "filename": Path(filepath).stem,
+                    "start_time": time.time(),
+                })
+ 
+                if verbose:
+                    logger.info(
+                        f"Started {Path(filepath).stem} "
+                        f"(pid={p.pid}, active={len(active)}/{num_workers}, queued={len(pending)})"
+                    )
+ 
+            new_active = []
+ 
+            for entry in active:
+                p = entry["proc"]
+                filepath = entry["file"]
+                filename = entry["filename"]
+                start_time = entry["start_time"]
+ 
+                # Finished normally
+                if not p.is_alive():
+                    p.join(timeout=0.2)
+ 
+                    result = None
+                    try:
+                        while True:
+                            candidate = result_queue.get_nowait()
+                            if candidate.get("filename") == filename:
+                                result = candidate
+                                break
+                            else:
+                                all_results.append(candidate)
+                                processed_count += 1
+                                if candidate.get("status") == "success":
+                                    success_count += 1
+                                else:
+                                    failed_count += 1
+                                pbar.update(1)
+                    except py_queue.Empty:
+                        pass
+ 
+                    if result is None:
+                        result = {
+                            "filename": filename,
+                            "filepath": filepath,
+                            "status": "failed",
+                            "error": "Worker exited without returning a result",
+                        }
+ 
+                    all_results.append(result)
+                    processed_count += 1
+ 
+                    if result.get("status") == "success":
+                        success_count += 1
+                    else:
+                        failed_count += 1
+ 
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        success=success_count,
+                        failed=failed_count,
+                        timeout=timeout_count,
+                        running=len(new_active),
+                        queued=len(pending),
+                    )
+ 
+                    if verbose:
+                        logger.info(f"[{processed_count}/{total_files}] Completed {filename}")
+ 
+                # Timed out
+                elif time.time() - start_time > per_file_timeout:
+                    logger.error(
+                        f"[{processed_count + 1}/{total_files}] Timeout processing {filename} "
+                        f"(>{per_file_timeout}s). Terminating child process pid={p.pid}."
+                    )
+ 
+                    p.terminate()
+                    p.join(timeout=1)
+ 
+                    result = {
+                        "filename": filename,
+                        "filepath": filepath,
+                        "status": "failed",
+                        "error": f"Timeout after {per_file_timeout}s",
+                    }
+ 
+                    all_results.append(result)
+                    processed_count += 1
+                    failed_count += 1
+                    timeout_count += 1
+ 
+                    pbar.update(1)
+                    pbar.set_postfix(
+                        success=success_count,
+                        failed=failed_count,
+                        timeout=timeout_count,
+                        running=len(new_active),
+                        queued=len(pending),
+                    )
+ 
+                # Still running and within timeout
+                else:
+                    new_active.append(entry)
+ 
+            active = new_active
+            time.sleep(0.2)
+ 
+    results_df = pd.DataFrame(all_results)
+    results_df.to_csv(output_csv, index=False)
+ 
+    logger.info("=" * 70)
+    logger.info("BATCH PROCESSING COMPLETE (GRU Sliding Window)")
+    logger.info("=" * 70)
+    logger.info(f"Total processed : {len(results_df)}")
+    logger.info(f"Successful      : {(results_df['status'] == 'success').sum()}")
+    logger.info(f"Failed          : {(results_df['status'] == 'failed').sum()}")
+    logger.info(f"Metrics saved to: {output_csv}")
+ 
+    return results_df
+ 
+ 
+# ============================================================================
+# BATCH PROCESSING  (ProcessPoolExecutor with timeout – mirrors UC model)
+# ============================================================================
+ 
+def process_batch(
+    csv_filepaths: List[str],
+    output_csv: str,
+    num_workers: int = 7,
+    epochs_train: int = 5,
+    epochs_warmstart: int = 5,
+    verbose: bool = False,
+    per_file_timeout: int = 300,
+):
+    """
+    Process multiple meter files in parallel using ProcessPoolExecutor
+    (same executor type and timeout mechanism as the UC model).
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if verbose:
+        logger.info(f"Using device: {device}")
+        logger.info(f"Processing {len(csv_filepaths)} files with {num_workers} workers")
+        logger.info(f"Per-file timeout: {per_file_timeout} seconds")
+ 
+    all_results = []
+ 
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
         futures = {}
-
         for filepath in csv_filepaths:
-            filename = Path(filepath).stem
-
-            # Submit task
             future = executor.submit(
                 process_single_meter,
                 filepath,
-                device=device,
+                device=None,          # each worker creates its own
                 epochs_train=epochs_train,
                 epochs_warmstart=epochs_warmstart,
                 verbose=verbose,
             )
-            futures[future] = filename
-
-        # Progress bar over completed futures
+            futures[future] = Path(filepath).stem
+ 
         for i, future in enumerate(
-            tqdm(as_completed(futures), total=len(futures), desc="Processing meters"),
-            1,
+            tqdm(as_completed(futures), total=len(futures), desc="Processing meters"), 1
         ):
             filename = futures[future]
             try:
-                result = future.result()
+                result = future.result(timeout=per_file_timeout)
                 all_results.append(result)
                 if verbose:
                     logger.info(f"[{i}/{len(futures)}] Completed {filename}")
-            except Exception as e:
-                logger.error(f"[{i}/{len(futures)}] Failed to process {filename}: {e}")
-                all_results.append(
-                    {
-                        "filename": filename,
-                        "status": "failed",
-                        "error": str(e),
-                    }
+            except TimeoutError:
+                logger.error(
+                    f"[{i}/{len(futures)}] Timeout processing {filename} "
+                    f"(>{per_file_timeout}s). Marking as failed."
                 )
-
-    # ===== SAVE RESULTS =====
+                future.cancel()
+                all_results.append({
+                    "filename": filename,
+                    "status":   "failed",
+                    "error":    f"Timeout after {per_file_timeout}s",
+                })
+            except Exception as e:
+                logger.error(f"[{i}/{len(futures)}] Failed {filename}: {e}")
+                all_results.append({
+                    "filename": filename,
+                    "status":   "failed",
+                    "error":    str(e),
+                })
+ 
     results_df = pd.DataFrame(all_results)
     results_df.to_csv(output_csv, index=False)
-
+ 
     logger.info("=" * 70)
-    logger.info("BATCH PROCESSING COMPLETE")
+    logger.info("BATCH PROCESSING COMPLETE (GRU Sliding Window)")
     logger.info("=" * 70)
-    logger.info(f"Total processed: {len(results_df)}")
-    logger.info(f"Successful: {(results_df['status'] == 'success').sum()}")
-    logger.info(f"Failed: {(results_df['status'] == 'failed').sum()}")
+    logger.info(f"Total processed : {len(results_df)}")
+    logger.info(f"Successful      : {(results_df['status'] == 'success').sum()}")
+    logger.info(f"Failed          : {(results_df['status'] == 'failed').sum()}")
     logger.info(f"Metrics saved to: {output_csv}")
-
-    # Print summary statistics
-    successful = results_df[results_df["status"] == "success"]
-    if len(successful) > 0:
-        logger.info("Metrics Summary (successful runs only):")
-        logger.info(
-            f"  RMSE: {successful['metric_rmse'].mean()} +/- {successful['metric_rmse'].std()}"
-        )
-        logger.info(
-            f"  MAE:  {successful['metric_mae'].mean()} +/- {successful['metric_mae'].std()}"
-        )
-        logger.info(
-            f"  R2:   {successful['metric_r2'].mean()} +/- {successful['metric_r2'].std()}"
-        )
-        logger.info(
-            f"  MAPE: {successful['metric_mape'].mean()} +/- {successful['metric_mape'].std()}"
-        )
-
+ 
     return results_df
 
 
 # ============================================================================
-# MAIN EXECUTION
+# MAIN
 # ============================================================================
 
-
 def main():
-    """Main entry point"""
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="GRU Batch Processor for Water Meter Anomaly Detection (PREDICTION-BASED)",
+        description="GRU Sliding-Window Batch Processor (comparable to UC model)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-
-    parser.add_argument(
-        "--workers", type=int, default=7, help="Number of parallel workers (default: 7)"
-    )
-    parser.add_argument(
-        "--epochs-train",
-        type=int,
-        default=10,
-        help="Epochs for initial training (default: 10)",
-    )
-    parser.add_argument(
-        "--epochs-warmstart",
-        type=int,
-        default=5,
-        help="Epochs for warm-start (default: 5)",
-    )
-    parser.add_argument(
-        "--verbose",
-        action="store_true",
-        default=False,
-        help="Enable verbose logging (default: False)",
-    )
+    parser.add_argument("--workers",          type=int, default=7)
+    parser.add_argument("--epochs-train",     type=int, default=5)
+    parser.add_argument("--epochs-warmstart", type=int, default=5)
+    parser.add_argument("--samples",          type=int, default=1000)
+    parser.add_argument("--verbose",          action="store_true", default=False)
 
     args = parser.parse_args()
 
-    # Reconfigure logger with verbosity
     global logger
     logger = setup_logging(verbose=args.verbose)
 
-    # ===== LOAD FILEPATHS =====
-    directory = "../data_w_diff_001"
+    directory  = "../data_w_diff_001"
     seed_value = 42
+    
+    #all_files = [
+    #    os.path.join(directory, f)
+    #    for f in os.listdir(directory)
+    #    if os.path.isfile(os.path.join(directory, f))
+    #]
+    #random.seed(seed_value)
+    #csv_filepaths = random.sample(all_files, min(args.samples, len(all_files)))
 
-    all_files = [
-        os.path.join(directory, f)
-        for f in os.listdir(directory)
-        if os.path.isfile(os.path.join(directory, f))
-    ]
-    random.seed(seed_value)
-    csv_filepaths = random.sample(all_files, min(1000, len(all_files)))
+    with open("../pickles/test_set.pkl", "rb") as f:
+        csv_filepaths = pickle.load(f)
 
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    # ===== OUTPUT FILE =====
-    output_csv = "./results_gru_prediction_1000_seed_42_epochs_10.csv"
+    output_csv = (
+        f"./6_weeks_results_gru_{args.samples}_seed_42_"
+        f"epochs_{args.epochs_train}_ws_{args.epochs_warmstart}_sliding_window_test_anomaly.csv"
+    )
 
-    # ===== RUN BATCH PROCESSING =====
-    _ = process_batch(
+    _ = process_batch_manual(
         csv_filepaths,
         output_csv,
         num_workers=args.workers,

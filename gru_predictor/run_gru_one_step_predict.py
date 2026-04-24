@@ -42,8 +42,7 @@ from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
 
 from calculate_metrics import calculate_metrics
-# Anomaly injection is available but commented out – mirrors UC model
-# from create_anomalies_dfs import inject_synthetic_anomalies
+from create_anomalies import inject_spike_anomalies_diff
 
 warnings.filterwarnings("ignore")
 
@@ -86,8 +85,7 @@ def get_periodicity(df: pd.DataFrame, timestamp_col: str = 'timestamp_utc') -> i
     if time_diffs.empty:
         raise ValueError("No time difference calculated. No two valid neighboring values found.")
 
-    common_periodicity_mode= time_diffs.mode()
-    #print(f"Periodicity found {common_periodicity_mode.iloc[0]/60} minutes.")
+    common_periodicity_mode = time_diffs.mode()
     return common_periodicity_mode.iloc[0]
 
 
@@ -95,27 +93,63 @@ def get_periodicity(df: pd.DataFrame, timestamp_col: str = 'timestamp_utc') -> i
 # HELPERS: z-scores and result dataframe  (identical to UC model)
 # ============================================================================
 
-def compute_z_scores(residuals):
+def compute_z_scores(residuals, ref_residuals=None):
+    """
+    Compute z-score and robust MAD-based score for each residual.
+
+    Statistics (mean, std, median, MAD) are estimated from ref_residuals
+    (intended to be the second training segment residuals) and then applied
+    to score residuals (intended to be the prediction segment residuals).
+    If ref_residuals is None, residuals itself is used as the reference,
+    which matches the old behaviour.
+
+    Parameters:
+    -----------
+    residuals : array-like
+        Residuals to be scored (prediction segment).
+    ref_residuals : array-like or None
+        Reference residuals used to estimate thresholding statistics
+        (second training segment). If None, falls back to residuals.
+
+    Returns:
+    --------
+    z_score : np.ndarray
+        Classical z-scores for each element of residuals.
+    z_score_robust : np.ndarray
+        Robust MAD-based scores for each element of residuals.
+    """
     residuals = np.asarray(residuals, dtype=float)
+
+    # Use ref_residuals for statistics if provided, otherwise fall back to residuals
+    if ref_residuals is not None:
+        ref = np.asarray(ref_residuals, dtype=float)
+    else:
+        ref = residuals
+
+    # Mask valid (non-NaN) values
+    valid_ref = ref[~np.isnan(ref)]
     valid = ~np.isnan(residuals)
-    res_valid = residuals[valid]
 
     z_score = np.full_like(residuals, np.nan)
     z_score_robust = np.full_like(residuals, np.nan)
 
-    if res_valid.size == 0:
+    if valid_ref.size == 0:
         return z_score, z_score_robust
 
-    res_mean = np.nanmean(res_valid)
-    res_std  = np.nanstd(res_valid, ddof=1)
+    # ---------- Classic mean/std z-score ----------
+    # Statistics estimated from the reference (second training) segment
+    res_mean = np.nanmean(valid_ref)
+    res_std  = np.nanstd(valid_ref, ddof=1)
 
     if not (np.isnan(res_std) or res_std == 0):
-        z_score[valid] = (res_valid - res_mean) / res_std
+        z_score[valid] = (residuals[valid] - res_mean) / res_std
     else:
         z_score[valid] = 0.0
 
-    median_resid = np.nanmedian(res_valid)
-    mad = np.nanmedian(np.abs(res_valid - median_resid))
+    # ---------- Robust median/MAD z-score ----------
+    # Statistics estimated from the reference (second training) segment
+    median_resid = np.nanmedian(valid_ref)
+    mad = np.nanmedian(np.abs(valid_ref - median_resid))
 
     if np.isnan(mad) or mad == 0:
         sigma_robust = res_std if not (np.isnan(res_std) or res_std == 0) else np.nan
@@ -125,15 +159,33 @@ def compute_z_scores(residuals):
     if np.isnan(sigma_robust) or sigma_robust == 0:
         z_score_robust[valid] = 0.0
     else:
-        z_score_robust[valid] = (res_valid - median_resid) / sigma_robust
+        z_score_robust[valid] = (residuals[valid] - median_resid) / sigma_robust
 
     return z_score, z_score_robust
 
 
 def build_results_df(df_predict, predictions, result,
+                     ref_residuals=None,
                      threshold_z_score=3, threshold_z_score_robust=3):
     """
     Build a result DataFrame with anomaly scores (identical signature to UC model).
+
+    Parameters:
+    -----------
+    df_predict : pd.DataFrame
+        Prediction segment dataframe with 'Diff' and 'timestamp_utc' columns.
+    predictions : array-like
+        Predicted Diff values (may contain NaN).
+    result : dict
+        Result dictionary to store summary counts.
+    ref_residuals : array-like or None
+        Residuals from the second training segment used to estimate
+        thresholding statistics (mean, std, median, MAD). If None,
+        the prediction segment residuals are used instead (old behaviour).
+    threshold_z_score : int
+        Threshold for the classical z-score (default: 3).
+    threshold_z_score_robust : int
+        Threshold for the robust MAD-based score (default: 3).
     """
     actuals    = df_predict["Diff"].values.astype(float)
     timestamps = df_predict["timestamp_utc"].values
@@ -156,7 +208,9 @@ def build_results_df(df_predict, predictions, result,
     })
 
     if anomalies is not None:
-        z_score, z_score_robust = compute_z_scores(residuals)
+        # Scores are computed on prediction residuals, but thresholding statistics
+        # (mean, std, median, MAD) are estimated from ref_residuals (second training segment)
+        z_score, z_score_robust = compute_z_scores(residuals, ref_residuals=ref_residuals)
         result_df["z_score"]        = z_score
         result_df["z_score_robust"] = z_score_robust
         result_df["is_anomaly_actual"] = anomalies
@@ -481,7 +535,7 @@ def train_gru(
             ckpt = torch.load(pretrained_model_path, map_location=device)
         model.load_state_dict(ckpt["model_state_dict"])
 
-    criterion = nn.MSELoss() #L1Loss or MSELoss
+    criterion = nn.MSELoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=learning_rate)
 
     step = max(2, epochs // 2) if is_warmstart else 10
@@ -596,6 +650,129 @@ def predict_with_gru(
 
 
 # ============================================================================
+# PREDICTION — ONLINE (one step at a time with anomaly masking)
+# ============================================================================
+
+def predict_with_gru_online(
+    model: GRUNet,
+    df_predict: pd.DataFrame,
+    scaler: StandardScaler,
+    window_size: int,
+    df_context: pd.DataFrame,
+    device: Optional[torch.device] = None,
+    ref_residuals: Optional[np.ndarray] = None,
+    z_threshold: float = 3,
+) -> np.ndarray:
+    """
+    One-step-ahead GRU prediction with online anomaly masking.
+
+    At each prediction step:
+      1. Predict y_hat from the current context window.
+      2. Compute residual |y_t - y_hat| and z-score it using statistics
+         estimated from ref_residuals (second training segment).
+      3. If |z| > z_threshold OR y_t is NaN: write the predicted Diff_norm
+         back into the feature matrix at position t so that future windows
+         use the model's own output as context instead of the anomalous value.
+      4. Otherwise: leave the actual value in the feature matrix as usual.
+
+    This mirrors production behaviour where a detected anomaly is not
+    allowed to corrupt the input context for subsequent predictions.
+
+    Parameters:
+    -----------
+    ref_residuals : np.ndarray or None
+        Residuals from the second training segment used to compute reference
+        mean and std for online z-score thresholding.
+    z_threshold : float
+        Z-score threshold above which an observation is masked (default: 3).
+    """
+    if device is None:
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    # Pre-compute reference statistics from second training residuals
+    if ref_residuals is not None:
+        ref = np.asarray(ref_residuals, dtype=float)
+        valid_ref = ref[~np.isnan(ref)]
+        ref_mean = float(np.nanmean(valid_ref)) if valid_ref.size > 0 else 0.0
+        ref_std  = float(np.nanstd(valid_ref, ddof=1)) if valid_ref.size > 1 else None
+    else:
+        ref_mean = None
+        ref_std  = None
+
+    # Build combined frame: context tail + prediction window
+    context_tail = df_context.iloc[-window_size:].copy()
+    combined = pd.concat([context_tail, df_predict], ignore_index=True)
+    combined["timestamp_utc"] = pd.to_datetime(combined["timestamp_utc"], utc=True)
+    combined = combined.sort_values("timestamp_utc").reset_index(drop=True)
+
+    # Preserve actual Diff values before NaN filling (used for residual computation)
+    actual_diff = combined["Diff"].values.astype(float)
+
+    # Fill NaNs for feature engineering
+    combined["Diff"] = combined["Diff"].fillna(method="ffill").fillna(0.0)
+
+    # Feature engineering
+    combined["time_delta"] = combined["timestamp_utc"].diff().dt.total_seconds() / 3600.0
+    combined["time_delta"].fillna(0, inplace=True)
+    combined["time_delta_norm"] = np.clip(combined["time_delta"], 0, 24) / 24.0
+    combined["Diff_norm"] = scaler.transform(combined[["Diff"]])
+    hours = combined["timestamp_utc"].dt.hour + combined["timestamp_utc"].dt.minute / 60.0
+    combined["sin_tod"] = np.sin(2 * np.pi * hours / 24.0)
+    combined["cos_tod"] = np.cos(2 * np.pi * hours / 24.0)
+    dow = combined["timestamp_utc"].dt.dayofweek
+    combined["sin_dow"] = np.sin(2 * np.pi * dow / 7.0)
+    combined["cos_dow"] = np.cos(2 * np.pi * dow / 7.0)
+
+    feature_cols = ["Diff_norm", "time_delta_norm", "sin_tod",
+                    "cos_tod", "sin_dow", "cos_dow"]
+    DIFF_NORM_COL = 0  # index of Diff_norm within feature_cols
+
+    # Copy to numpy for efficient in-place updates when masking anomalies
+    features = combined[feature_cols].values.copy()   # (n_total, 6)
+
+    n_context = len(context_tail)
+    n_total   = len(combined)
+    n_predict = n_total - n_context
+
+    predictions = np.full(n_predict, np.nan)
+
+    model.eval()
+    with torch.no_grad():
+        for t in range(window_size, n_total):
+            # ── Forward pass ─────────────────────────────────────────────
+            w = features[t - window_size : t]
+            X = torch.tensor(w, dtype=torch.float32).unsqueeze(0).to(device)
+            pred_norm = float(model(X).squeeze().cpu().numpy())
+
+            # Only score and store predictions for the prediction window
+            if t < n_context:
+                continue
+
+            pred_idx = t - n_context
+
+            # Denormalise and clip
+            y_hat = max(float(scaler.inverse_transform([[pred_norm]])[0][0]), 0.0)
+            predictions[pred_idx] = y_hat
+
+            # ── Decide whether to mask ────────────────────────────────────
+            y_t = actual_diff[t]
+            skip = bool(np.isnan(y_t))
+
+            if not skip and ref_std is not None and ref_std > 0:
+                residual = abs(y_t - y_hat)
+                z = (residual - ref_mean) / ref_std
+                if abs(z) > z_threshold:
+                    skip = True
+
+            # ── If anomalous: replace actual with predicted in feature matrix
+            # so future windows use the model's output as context, not the spike
+            if skip:
+                features[t, DIFF_NORM_COL] = pred_norm
+
+    return predictions
+
+
+# ============================================================================
 # SINGLE-METER PROCESSING
 # ============================================================================
 
@@ -615,6 +792,11 @@ def process_single_meter(
 
     The split, seed, resampling, and metrics are identical to the UC model
     so that results are directly comparable.
+
+    Anomaly scoring:
+    - Thresholding statistics (mean, std, median, MAD) are estimated from the
+      second training segment residuals and then applied to score the prediction
+      segment residuals, so that the calibration window is anomaly-free.
     """
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -719,18 +901,62 @@ def process_single_meter(
             logger.info(f"  Warm-start done.")
 
         # ===================================================================
-        # PREDICTION
+        # COMPUTE REFERENCE RESIDUALS FROM SECOND TRAINING SEGMENT
+        # These residuals are used to estimate thresholding statistics
+        # (mean, std, median, MAD) for anomaly scoring, ensuring the
+        # calibration window is anomaly-free.
+        # df_train is used as context (mirrors UC's init_second_mean/cov,
+        # which carried state from the end of initial training into df_second).
         # ===================================================================
+        if verbose:
+            logger.info(f"  Computing reference residuals from second training segment...")
+
+        t0 = time.time()
+        second_predictions = predict_with_gru(
+            model=model,
+            df_predict=df_second,
+            scaler=scaler,
+            window_size=window_size,
+            df_context=df_train,   # initial training segment provides history
+            device=device,
+        )
+        result["second_prediction_time_seconds"] = time.time() - t0
+
+        second_actuals  = df_second["Diff"].values.astype(float)
+        second_residuals = np.abs(second_actuals - second_predictions)
+
+        if verbose:
+            logger.info(f"  Reference residuals computed.")
+
+        # ===================================================================
+        # INJECT ANOMALIES INTO PREDICTION SEGMENT
+        # Injection happens after all training and after reference residuals
+        # are computed, so model parameters and thresholding statistics are
+        # not affected by the injected anomalies.
+        # ===================================================================
+        df_predict = inject_spike_anomalies_diff(df_predict, random_state=int(result["filename"]))
+
+        if verbose:
+            logger.info(f"  Anomalies injected.")
+
+        # ===================================================================
+        # PREDICTION
         # df_second is used as context so the first prediction timestep has
         # a full window of history (mirrors UC's state carry-over).
+        # Online masking: if a step is flagged as anomalous (|z| > threshold),
+        # the predicted value is fed back as context for subsequent steps so
+        # the spike does not corrupt future predictions.
+        # ===================================================================
         t0 = time.time()
-        predictions = predict_with_gru(
+        predictions = predict_with_gru_online(
             model=model,
             df_predict=df_predict,
             scaler=scaler,
             window_size=window_size,
             df_context=df_second,
             device=device,
+            ref_residuals=second_residuals,
+            z_threshold=threshold_z_score,
         )
         result["prediction_time_seconds"] = time.time() - t0
 
@@ -739,10 +965,14 @@ def process_single_meter(
 
         # ===================================================================
         # BUILD RESULTS DATAFRAME  (same helper as UC model)
+        # Scores applied to prediction residuals, statistics estimated from
+        # second training segment residuals.
         # ===================================================================
         predictions_df = build_results_df(
             df_predict, predictions, result,
-            threshold_z_score, threshold_z_score_robust
+            ref_residuals=second_residuals,
+            threshold_z_score=threshold_z_score,
+            threshold_z_score_robust=threshold_z_score_robust,
         )
 
         if predictions_output_csv is not None:
@@ -759,7 +989,7 @@ def process_single_meter(
 
         metrics = calculate_metrics(predictions_df)
         for key, value in metrics.items():
-            result[f"unresampled_metric_{key}"] = value
+            result[f"metric_{key}"] = value
 
         result["status"] = "success"
         result['converged_train'] = True
@@ -907,8 +1137,6 @@ def process_batch_manual(
                                 result = candidate
                                 break
                             else:
-                                # put unrelated results back into a temporary list if needed
-                                # simplified assumption: one finished worker at a time
                                 all_results.append(candidate)
                                 processed_count += 1
                                 if candidate.get("status") == "success":
@@ -1090,7 +1318,7 @@ def main():
         description="GRU Sliding-Window Batch Processor (comparable to UC model)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("--workers",          type=int, default=4)
+    parser.add_argument("--workers",          type=int, default=7)
     parser.add_argument("--epochs-train",     type=int, default=5)
     parser.add_argument("--epochs-warmstart", type=int, default=5)
     parser.add_argument("--samples",          type=int, default=1000)
@@ -1101,23 +1329,11 @@ def main():
     global logger
     logger = setup_logging(verbose=args.verbose)
 
-    # ── File selection: identical seed + logic to UC model ──────────────────
     directory  = "../data_w_diff_001"
     seed_value = 42
 
-    #all_files = [
-    #    os.path.join(directory, f)
-    #    for f in os.listdir(directory)
-    #    if os.path.isfile(os.path.join(directory, f))
-    #]
-    #random.seed(seed_value)
-    #csv_filepaths = random.sample(all_files, min(args.samples, len(all_files)))
-
-    
     with open("../pickles/test_set.pkl", "rb") as f:
         csv_filepaths = pickle.load(f)
-        
-    #csv_filepaths = csv_filepaths[16000:]
 
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
