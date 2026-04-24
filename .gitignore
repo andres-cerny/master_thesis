@@ -19,3 +19,4 @@ test_pred_seasonal.csv
 test_pred.csv
 
 *.csv
+*.zip
