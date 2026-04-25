@@ -49,6 +49,10 @@ from numpy.random import default_rng
 
 
 from resample import fill_gaps_with_periodicity_adaptive, get_periodicity
+
+parent_path = os.path.join(os.path.dirname(__file__), '..')
+sys.path.append(parent_path)
+
 from calculate_metrics import calculate_metrics, calculate_metrics_unresampled
 from create_anomalies import inject_spike_anomalies_diff
 
@@ -170,7 +174,7 @@ def calculate_seasonal_period(
 
 import numpy as np
 
-def compute_z_scores(residuals, ref_residuals=None):
+def compute_z_scores(residuals, result, ref_residuals=None):
     """
     Compute z-score and robust MAD-based score for each residual.
 
@@ -220,6 +224,9 @@ def compute_z_scores(residuals, ref_residuals=None):
     # Statistics estimated from the reference (second training) segment
     res_mean = np.nanmean(valid_ref)
     res_std = np.nanstd(valid_ref, ddof=1)
+    
+    result["ref_mean"] = res_mean
+    result["ref_std"] = res_std
 
     if not (np.isnan(res_std) or res_std == 0):
         z_score[valid] = (residuals[valid] - res_mean) / res_std
@@ -283,7 +290,7 @@ def build_results_df(df_predict, predictions, result, ref_residuals=None, thresh
         anomalies_floats = np.asarray(anomalies_floats)
         anomalies = (anomalies_floats != 0.0).astype(int)
     else:
-        anomalies = None
+        anomalies = np.zeros(len(df_predict), dtype=int)
     
     timestamps = pd.to_datetime(timestamps, utc=True)
     actuals = np.asarray(actuals)
@@ -303,7 +310,7 @@ def build_results_df(df_predict, predictions, result, ref_residuals=None, thresh
     if anomalies is not None:
         # Scores are computed on prediction residuals, but thresholding statistics
         # (mean, std, median, MAD) are estimated from ref_residuals (second training segment)
-        z_score, z_score_robust = compute_z_scores(residuals, ref_residuals=ref_residuals)
+        z_score, z_score_robust = compute_z_scores(residuals, result, ref_residuals=ref_residuals)
         result_df["z_score"] = z_score
         result_df["z_score_robust"] = z_score_robust
         result_df["is_anomaly_actual"] = anomalies
@@ -752,7 +759,7 @@ def process_single_meter(
     verbose: bool = False,
     predictions_output_csv: Optional[str] = None,
     weekly_seasonality: bool = True,
-    daily_steps: bool = True,
+    daily_steps: bool = False,
     threshold_z_score: int = 3,
     threshold_z_score_robust: int = 3
 ) -> Dict:
@@ -918,7 +925,7 @@ def process_single_meter(
         # ===================================================================
         # Inject anomalies to prediction df 
         # ===================================================================
-        df_predict = inject_spike_anomalies_diff(df_predict, random_state=int(result['filename']))
+        #df_predict = inject_spike_anomalies_diff(df_predict, random_state=int(result['filename']))
         
         if verbose:
             logger.info(f"Injection done {result['filename']} done, predicting...")    
@@ -952,6 +959,8 @@ def process_single_meter(
             threshold_z_score=threshold_z_score,
             threshold_z_score_robust=threshold_z_score_robust,
         )
+        
+        result["z_scores"] = predictions_df["z_score"].tolist()
 
         if predictions_output_csv is not None:
             predictions_df.to_csv(predictions_output_csv, index=False)
@@ -1075,6 +1084,16 @@ def process_batch(
 
     results_df = pd.DataFrame(all_results)
     results_df.to_csv(output_csv, index=False)
+    
+
+    # save flat z-score file
+    zscore_rows = []
+    for r in all_results:
+        if r.get("status") == "success" and "z_scores" in r:
+            for z in r["z_scores"]:
+                zscore_rows.append({"filename": r["filename"], "z_score": z})
+
+    pd.DataFrame(zscore_rows).to_csv(output_csv.replace(".csv", "_zscores.csv"), index=False)
 
     logger.info("=" * 70)
     logger.info("BATCH PROCESSING COMPLETE (Seasonal UnobservedComponents)")
@@ -1140,20 +1159,15 @@ def main():
 #
     #csv_filepaths = random.sample(all_files, min(args.samples, len(all_files)))
     
-    with open("../pickles/test_set.pkl", "rb") as f:
-        csv_filepaths = pickle.load(f)
+    #with open("../pickles/test_set.pkl", "rb") as f:
+    #    csv_filepaths = pickle.load(f)
       
-    #csv_filepaths = csv_filepaths[15000:]
+    with open("../pickles/common_sensors.pkl", "rb") as f:
+        csv_filepaths = pickle.load(f)
     
-    #directory = "../data_w_anomalies"
-    #csv_filepaths = [
-    #    os.path.join(directory, f)
-    #    for f in os.listdir(directory)
-    #    if os.path.isfile(os.path.join(directory, f))
-    #]
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    output_csv = f"./6_weeks_results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_120_reworked_daily_steps_weekly_fourier_anomalies_test.csv"
+    output_csv = f"./6_weeks_results_seasonal_uc_{args.samples}_seed_42_{args.seasonal}_clipped_tree_timeout_120_reworked_daily_weekly_fourier_anomalies_common_z_score.csv"
     
     _ = process_batch(
         csv_filepaths,

@@ -9,3 +9,7 @@ result*
 test
 remove_long_train.ipynb
 chech_anomaly_prediction.ipynb
+*.parquet
+*.csv
+create_anomalies.py
+calculate_metrics.py

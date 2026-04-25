@@ -22,6 +22,7 @@ Usage:
 """
 
 import os
+import sys
 import pickle
 import random
 import time
@@ -40,6 +41,9 @@ from numpy.random import default_rng
 from torch.utils.data import Dataset, DataLoader
 from sklearn.preprocessing import StandardScaler
 from tqdm import tqdm
+
+parent_path = os.path.join(os.path.dirname(__file__), '..')
+sys.path.append(parent_path)
 
 from calculate_metrics import calculate_metrics
 from create_anomalies import inject_spike_anomalies_diff
@@ -93,7 +97,7 @@ def get_periodicity(df: pd.DataFrame, timestamp_col: str = 'timestamp_utc') -> i
 # HELPERS: z-scores and result dataframe  (identical to UC model)
 # ============================================================================
 
-def compute_z_scores(residuals, ref_residuals=None):
+def compute_z_scores(residuals, result, ref_residuals=None):
     """
     Compute z-score and robust MAD-based score for each residual.
 
@@ -140,7 +144,10 @@ def compute_z_scores(residuals, ref_residuals=None):
     # Statistics estimated from the reference (second training) segment
     res_mean = np.nanmean(valid_ref)
     res_std  = np.nanstd(valid_ref, ddof=1)
-
+    
+    result["ref_mean"] = res_mean
+    result["ref_std"] = res_std
+    
     if not (np.isnan(res_std) or res_std == 0):
         z_score[valid] = (residuals[valid] - res_mean) / res_std
     else:
@@ -193,7 +200,7 @@ def build_results_df(df_predict, predictions, result,
     if "is_anomaly" in df_predict.columns:
         anomalies = np.asarray(df_predict["is_anomaly"].values)
     else:
-        anomalies = None
+        anomalies = np.zeros(len(df_predict), dtype=int)
 
     timestamps  = pd.to_datetime(timestamps, utc=True)
     actuals     = np.asarray(actuals)
@@ -210,7 +217,7 @@ def build_results_df(df_predict, predictions, result,
     if anomalies is not None:
         # Scores are computed on prediction residuals, but thresholding statistics
         # (mean, std, median, MAD) are estimated from ref_residuals (second training segment)
-        z_score, z_score_robust = compute_z_scores(residuals, ref_residuals=ref_residuals)
+        z_score, z_score_robust = compute_z_scores(residuals, result, ref_residuals=ref_residuals)
         result_df["z_score"]        = z_score
         result_df["z_score_robust"] = z_score_robust
         result_df["is_anomaly_actual"] = anomalies
@@ -934,7 +941,7 @@ def process_single_meter(
         # are computed, so model parameters and thresholding statistics are
         # not affected by the injected anomalies.
         # ===================================================================
-        df_predict = inject_spike_anomalies_diff(df_predict, random_state=int(result["filename"]))
+        #df_predict = inject_spike_anomalies_diff(df_predict, random_state=int(result["filename"]))
 
         if verbose:
             logger.info(f"  Anomalies injected.")
@@ -974,6 +981,8 @@ def process_single_meter(
             threshold_z_score=threshold_z_score,
             threshold_z_score_robust=threshold_z_score_robust,
         )
+        
+        result["z_scores"] = predictions_df["z_score"].tolist()
 
         if predictions_output_csv is not None:
             predictions_df.to_csv(predictions_output_csv, index=False)
@@ -1215,6 +1224,14 @@ def process_batch_manual(
 
     results_df = pd.DataFrame(all_results)
     results_df.to_csv(output_csv, index=False)
+    
+    zscore_rows = []
+    for r in all_results:
+        if r.get("status") == "success" and "z_scores" in r:
+            for z in r["z_scores"]:
+                zscore_rows.append({"filename": r["filename"], "z_score": z})
+    
+    pd.DataFrame(zscore_rows).to_csv(output_csv.replace(".csv", "_zscores.csv"), index=False)
 
     logger.info("=" * 70)
     logger.info("BATCH PROCESSING COMPLETE (GRU Sliding Window)")
@@ -1332,14 +1349,17 @@ def main():
     directory  = "../data_w_diff_001"
     seed_value = 42
 
-    with open("../pickles/test_set.pkl", "rb") as f:
-        csv_filepaths = pickle.load(f)
+    #with open("../pickles/test_set.pkl", "rb") as f:
+    #    csv_filepaths = pickle.load(f)
 
+    with open("../pickles/common_sensors.pkl", "rb") as f:
+        csv_filepaths = pickle.load(f)
+    
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
     output_csv = (
         f"./6_weeks_results_gru_{args.samples}_seed_42_"
-        f"epochs_{args.epochs_train}_ws_{args.epochs_warmstart}_sliding_window_test.csv"
+        f"epochs_{args.epochs_train}_ws_{args.epochs_warmstart}_sliding_window_anomalies_common_z_score.csv"
     )
 
     _ = process_batch_manual(

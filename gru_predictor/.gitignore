@@ -1,3 +1,5 @@
 result*
 *.log
 temp_models/*
+*.parquet
+*.csv
