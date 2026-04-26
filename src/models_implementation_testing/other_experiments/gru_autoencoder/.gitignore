@@ -2,3 +2,4 @@ temp_models/*
 *.log
 result*
 *pt
+*.csv

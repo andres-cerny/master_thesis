@@ -8,7 +8,5 @@ __pycache__
 *.log
 
 
-*.csv
 *.zip
 *.png
-*.json

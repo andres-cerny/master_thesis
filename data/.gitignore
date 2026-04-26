@@ -1,1 +1,4 @@
-*.json
+metadata/*
+metadata_resample/*
+original_data/*
+sensor_data/*
