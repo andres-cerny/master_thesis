@@ -1,23 +1,14 @@
 .venv/*
 .venv
-zasilka-TP4VGT9M89DDMFIM/*
 split_data/*
-data/*
-metadata/*
-metadata_001/*
-metadata_resample/*
-pickles/*
+
 __pycache__/*
 __pycache__
-filled_data_complete.csv
-*.log
-data_w_diff_001.csv/*
 
-test_filled_137402.csv
-test_pred_gru.csv
-test_pred_seasonal.csv
-test_pred.csv
+*.log
+
 
 *.csv
 *.zip
 *.png
+*.json
