@@ -14,7 +14,7 @@
 
 ## Overview
 
-This repository contains all code and source materials for the master's thesis *Anomaly Detection in Water Consumption Time Series*. The work addresses unsupervised anomaly detection in a large-scale industrial water metering dataset provided by [Softlink s.r.o.](https://www.softlink.cz/), comprising over **618 million readings** from more than **27,000 sensors** across industrial, municipal, and commercial sites in the Czech Republic.
+This repository contains all code and source materials for the master's thesis *Anomaly Detection in Water Consumption Time Series*. The work addresses anomaly detection in a large-scale industrial water metering dataset provided by [Softlink s.r.o.](https://www.softlink.cz/), comprising over **618 million readings** from more than **27,000 sensors** across industrial, municipal, and commercial sites in the Czech Republic.
 
 Two families of models are developed and compared:
 
