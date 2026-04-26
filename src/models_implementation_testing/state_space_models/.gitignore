@@ -1,0 +1,15 @@
+results_local_trend_test.csv
+local_trend_batch_processor.log
+__pycache__/*
+__pycache__
+*.log
+*.pkl
+*copy.py
+test
+remove_long_train.ipynb
+chech_anomaly_prediction.ipynb
+*.parquet
+*.csv
+create_anomalies.py
+calculate_metrics.py
+error_examination.ipynb
