@@ -38,6 +38,7 @@ diplomka/
 │   └── sensor_data/                     # Preprocessed per-sensor CSVs used by the models
 │
 ├── src/
+│   ├── requirements.txt                 # Python dependencies
 │   ├── data_examination/                # Dataset preprocessing, exploration, metadata
 │   │   ├── data_exploration.ipynb
 │   │   └── helper_scripts/
@@ -117,7 +118,13 @@ The following is the rough order in which the code is intended to be run:
 
 ## Requirements
 
-The code is Python 3.10+. Main dependencies:
+The code is Python 3.10+. Install all dependencies with:
+
+```bash
+pip install -r src/requirements.txt
+```
+
+Main dependencies:
 
 ```
 numpy
