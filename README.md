@@ -14,7 +14,9 @@
 
 ## Overview
 
-This repository contains all code and source materials for the master's thesis *Anomaly Detection in Water Consumption Time Series*. The work addresses anomaly detection in a large-scale industrial water metering dataset provided by [Softlink s.r.o.](https://www.softlink.cz/), comprising over **618 million readings** from more than **27,000 sensors** across industrial, municipal, and commercial sites in the Czech Republic.
+This repository contains the source code for the master's thesis *Anomaly Detection in Water Consumption Time Series*. The work addresses anomaly detection in a large-scale industrial water metering dataset provided by [Softlink s.r.o.](https://www.softlink.cz/), comprising over **618 million readings** from more than **27,000 sensors** across industrial, municipal, and commercial sites in the Czech Republic.
+
+The dataset provided cannot be found here because of its size (>10GB), but can be found on [Zenodo](https://zenodo.org/records/19735021).
 
 Two families of models are developed and compared:
 
@@ -29,6 +31,12 @@ Residuals are thresholded using either a classical **z-score** or a robust **MAD
 
 ```
 diplomka/
+├── data/
+│   ├── metadata/                        # Per-sensor JSON metadata for sensor_data
+│   ├── metadata_resample/               # Per-sensor JSON metadata for resampled sensor_data
+│   ├── original_data/                   # Raw data as received from Softlink
+│   └── sensor_data/                     # Preprocessed per-sensor CSVs used by the models
+│
 ├── src/
 │   ├── data_examination/                # Dataset preprocessing, exploration, metadata
 │   │   ├── data_exploration.ipynb
@@ -78,6 +86,11 @@ diplomka/
         └── bib-database.bib
 ```
 
+### Data Folder
+
+The `data/` subfolders are all empty in this repository as the data is too large to include. The sensor data for running the models can be found on [Zenodo](https://zenodo.org/records/19735021).
+
+
 ---
 
 ## End-to-End Pipeline
@@ -120,7 +133,7 @@ upsetplot
 pytz
 ```
 
-The dataset itself is **not** included in this repository — it is the property of Softlink s.r.o. Paths in the scripts assume a local `data_w_diff_001/` folder of per-sensor CSVs and a `metadata_001/` folder of per-sensor JSON metadata.
+The dataset itself is **not** included in this repository because of its size (>10GB), but can be found on [Zenodo](https://zenodo.org/records/19735021).
 
 ---
 
