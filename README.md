@@ -75,16 +75,18 @@ diplomka/
 │           └── compare_gru_dynamic_trend.ipynb
 │
 └── thesis_text/                         # LaTeX source for the written thesis
-    ├── ctufit-thesis.tex
-    ├── ctufit-thesis.cls
-    ├── changelog.md
-    ├── LICENSE
-    ├── .gitlab-ci.yml
+    ├── ctufit-thesis.pdf                # This thesis rendered PDF version
+    ├── ctufit-thesis.tex                # Main entry point — compile this file
+    ├── ctufit-thesis.cls                # CTU FIT thesis document class (do not edit)
+    ├── changelog.md                     # Class version changelog
+    ├── LICENSE                          # LPPL (template license)
+    ├── .gitlab-ci.yml                   # CI pipeline that builds the PDF on GitLab
+    ├── images/                          # Image assets used in the thesis
     └── text/
-        ├── text.tex
-        ├── appendix.tex
-        ├── medium.tex
-        └── bib-database.bib
+        ├── text.tex                     # All thesis chapters (included from main file)
+        ├── appendix.tex                 # Appendix
+        ├── medium.tex                   # Attached-medium description page
+        └── bib-database.bib            # BibLaTeX bibliography
 ```
 
 ### Data Folder
