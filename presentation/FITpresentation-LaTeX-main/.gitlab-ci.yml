@@ -1,0 +1,33 @@
+image: texlive/texlive:latest
+
+LuaLaTeX:
+    script: 
+        - sed 's/\[czech/\[english/' ctufit-presentation.tex > ctufit-presentation-en.tex
+        - sed 's/\[czech/\[czech,sage/' ctufit-presentation.tex > ctufit-presentation-sage.tex
+        - sed 's/\[czech/\[czech,blue/' ctufit-presentation.tex > ctufit-presentation-blue.tex
+        - latexmk -pdflua ctufit-presentation.tex
+        - latexmk -pdflua ctufit-presentation-en.tex
+        - latexmk -pdflua ctufit-presentation-sage.tex
+        - latexmk -pdflua ctufit-presentation-blue.tex
+    artifacts:
+        paths:
+            - ctufit-presentation.pdf
+            - ctufit-presentation-en.pdf
+            - ctufit-presentation-sage.pdf
+            - ctufit-presentation-blue.pdf
+
+XeLaTeX:
+    script: 
+        - sed 's/\[czech/\[english/' ctufit-presentation.tex > ctufit-presentation-en.tex
+        - sed 's/\[czech/\[czech,sage/' ctufit-presentation.tex > ctufit-presentation-sage.tex
+        - sed 's/\[czech/\[czech,blue/' ctufit-presentation.tex > ctufit-presentation-blue.tex
+        - latexmk -pdfxe ctufit-presentation.tex
+        - latexmk -pdfxe ctufit-presentation-en.tex
+        - latexmk -pdfxe ctufit-presentation-sage.tex
+        - latexmk -pdfxe ctufit-presentation-blue.tex
+    artifacts:
+        paths:
+            - ctufit-presentation.pdf
+            - ctufit-presentation-en.pdf
+            - ctufit-presentation-sage.pdf
+            - ctufit-presentation-blue.pdf
