@@ -1346,14 +1346,17 @@ def main():
     global logger
     logger = setup_logging(verbose=args.verbose)
 
-    directory  = "../data_w_diff_001"
+
     seed_value = 42
+    directory = "../../../data/sensor_data"
 
-    #with open("../pickles/test_set.pkl", "rb") as f:
+    with open("../../pickles/test_set.pkl", "rb") as f:
+        csv_filenames = pickle.load(f)
+
+    csv_filepaths = [os.path.join(directory, name) for name in csv_filenames]
+
+    #with open("../pickles/common_sensors.pkl", "rb") as f:
     #    csv_filepaths = pickle.load(f)
-
-    with open("../pickles/common_sensors.pkl", "rb") as f:
-        csv_filepaths = pickle.load(f)
     
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
