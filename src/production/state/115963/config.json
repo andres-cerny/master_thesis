@@ -1,0 +1,37 @@
+{
+  "schema_version": 1,
+  "meter_id": "115963",
+  "periodicity_seconds": 3619.0,
+  "tolerance_percentage": 10.0,
+  "daily_period_steps": 24,
+  "weekly_period_steps": 168,
+  "freq_seasonal": [
+    {
+      "period": 168,
+      "harmonics": 2
+    },
+    {
+      "period": 24,
+      "harmonics": 2
+    }
+  ],
+  "k_positions": 2,
+  "k_hours": 2.0,
+  "z_threshold": 3.5,
+  "global_mean": 0.1094787425353971,
+  "global_std": 0.11619190276210893,
+  "structural_signature": "{\"daily_period_steps\": 24, \"freq_seasonal\": [{\"harmonics\": 2, \"period\": 168}, {\"harmonics\": 2, \"period\": 24}], \"periodicity_seconds\": 3619.0, \"weekly_period_steps\": 168}",
+  "outage_cap_steps": 168,
+  "theta": [
+    0.01964688080549987,
+    4.760712713448191e-06,
+    1.3475242968821748e-07,
+    0.00010613728093114924
+  ],
+  "warm_started": false,
+  "converged": true,
+  "holdout_days": 0.0,
+  "n_fit": 26669,
+  "n_ref": 26669,
+  "trained_at": "2026-06-14T18:17:35.223819+00:00"
+}

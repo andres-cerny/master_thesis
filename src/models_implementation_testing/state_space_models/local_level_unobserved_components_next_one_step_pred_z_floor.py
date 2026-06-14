@@ -195,6 +195,20 @@ def compute_k_positions(daily_period_steps, k_hours=2.0, min_k=2):
     """
     return max(min_k, int(round(k_hours * daily_period_steps / 24)))
 
+def band_floor(global_sd, signal_scale, frac_global=0.3, frac_scale=0.10):
+    """
+    Minimum band sigma (Diff units). Prevents a near-zero calibration sigma
+    from producing a hair-trigger detection band. The band is never tighter
+    than frac_global * global_sd (sensor's overall residual spread) or
+    frac_scale * signal_scale (typical non-zero consumption).
+    """
+    terms = []
+    if global_sd is not None and np.isfinite(global_sd):
+        terms.append(frac_global * global_sd)
+    if signal_scale is not None and np.isfinite(signal_scale) and signal_scale > 0:
+        terms.append(frac_scale * signal_scale)
+    return max(terms) if terms else 0.0
+
 
 # ============================================================================
 # HELPER: RESIDUAL-BASED ANOMALIES
@@ -203,7 +217,9 @@ def compute_k_positions(daily_period_steps, k_hours=2.0, min_k=2):
 
 def compute_z_scores(residuals, result, ref_residuals=None,
                      pred_positions=None, ref_positions=None,
-                     daily_period_steps=None, k_positions=None):
+                     daily_period_steps=None, k_positions=None,
+                     signal_scale=None, sigma_floor_frac_global=0.3,
+                     sigma_floor_frac_scale=0.25):
     """
     Compute z-score and robust MAD-based score for each residual.
 
@@ -286,6 +302,16 @@ def compute_z_scores(residuals, result, ref_residuals=None,
     global_median = float(np.nanmedian(valid_ref))
     global_mad = float(np.nanmedian(np.abs(valid_ref - global_median)))
     global_sigma_robust = 1.4826 * global_mad if global_mad > 0 else global_std
+    
+    # Detection-band floor: never tighter than a fraction of the sensor's
+    # overall residual spread or of typical consumption. Fixes the hair-trigger
+    # FP flood on over-predictable (high-F_S / low-resid_cv2) sensors.
+    fl_classic = band_floor(global_std, signal_scale,
+                            sigma_floor_frac_global, sigma_floor_frac_scale)
+    fl_robust = band_floor(global_sigma_robust, signal_scale,
+                           sigma_floor_frac_global, sigma_floor_frac_scale)
+    global_std = max(global_std, fl_classic)
+    global_sigma_robust = max(global_sigma_robust, fl_robust)
 
     if conditional:
         means, stds, medians, mads = compute_per_position_stats(
@@ -307,6 +333,10 @@ def compute_z_scores(residuals, result, ref_residuals=None,
         bad_robust = np.isnan(med) | np.isnan(mad_arr) | (mad_arr == 0)
         med = np.where(bad_robust, global_median, med)
         sigma = np.where(bad_robust, global_sigma_robust, 1.4826 * mad_arr)
+        
+        # Floor per-position bands too (quiet night positions, etc.).
+        sd = np.maximum(sd, fl_classic)
+        sigma = np.maximum(sigma, fl_robust)
 
         sd_safe = np.where(sd == 0, 1.0, sd)
         sigma_safe = np.where(sigma == 0, 1.0, sigma)
@@ -362,7 +392,9 @@ def build_results_df(df_predict, predictions, result, ref_residuals=None,
                      ref_timestamps=None, periodicity_seconds=None,
                      daily_period_steps=None, k_positions=None,
                      threshold_z_score=3, threshold_z_score_robust=3,
-                     save_detection_bands=False):
+                     save_detection_bands=False,
+                     signal_scale=None, sigma_floor_frac_global=0.3,
+                     sigma_floor_frac_scale=0.25):
     """
     Build a result DataFrame with anomaly scores based on residuals.
 
@@ -458,13 +490,13 @@ def build_results_df(df_predict, predictions, result, ref_residuals=None,
         ref_positions = None
 
     z_score, z_score_robust, mu_used, sd_used, med_used, sigma_used = compute_z_scores(
-        residuals,
-        result,
+        residuals, result,
         ref_residuals=ref_residuals,
-        pred_positions=pred_positions,
-        ref_positions=ref_positions,
-        daily_period_steps=daily_period_steps,
-        k_positions=k_positions,
+        pred_positions=pred_positions, ref_positions=ref_positions,
+        daily_period_steps=daily_period_steps, k_positions=k_positions,
+        signal_scale=signal_scale,
+        sigma_floor_frac_global=sigma_floor_frac_global,
+        sigma_floor_frac_scale=sigma_floor_frac_scale,
     )
 
     result_df["z_score"] = z_score
@@ -646,7 +678,9 @@ def predict_model_online(df_predict, result, freq_seasonal, stochastic_freq_seas
                          init_state_mean, init_state_cov, theta,
                          ref_residuals=None, ref_timestamps=None,
                          periodicity_seconds=None, daily_period_steps=None,
-                         k_positions=None, z_threshold=3):
+                         k_positions=None, z_threshold=3,
+                         signal_scale=None, sigma_floor_frac_global=0.3,
+                         sigma_floor_frac_scale=0.25):
     """
     One-step-ahead prediction with online anomaly masking.
 
@@ -734,6 +768,9 @@ def predict_model_online(df_predict, result, freq_seasonal, stochastic_freq_seas
         result['ref_mean'] = None
         result['ref_std'] = None
 
+    band_floor_value = band_floor(global_std, signal_scale,
+                                  sigma_floor_frac_global, sigma_floor_frac_scale)
+    
     t_start_pred = time.time()
     try:
         # Build the model with a dummy endog to extract system matrices.
@@ -801,6 +838,13 @@ def predict_model_online(df_predict, result, freq_seasonal, stochastic_freq_seas
                         mu, sd = global_mean, global_std
                 else:
                     mu, sd = global_mean, global_std
+                    
+                # Floor the band so a near-zero calibration sigma can't flag
+                # normal points (matches compute_z_scores).
+                if sd is None or not np.isfinite(sd):
+                    sd = band_floor_value if band_floor_value > 0 else sd
+                else:
+                    sd = max(sd, band_floor_value)
 
                 if sd is not None and sd > 0:
                     residual = abs(y_t - y_hat)
@@ -1010,11 +1054,13 @@ def process_single_meter(
     device: Optional[torch.device] = None,
     verbose: bool = False,
     predictions_output_csv: Optional[str] = None,
-    threshold_z_score: int = 3.5,
+    threshold_z_score: int = 3,
     threshold_z_score_robust: int = 3,
     k_hours: float = 2.0,
     min_k_positions: int = 2,
     save_detection_bands: bool = False,
+    sigma_floor_frac_global: float = 0.3,
+    sigma_floor_frac_scale: float = 0.10,
 ) -> Dict:
     """
     Process a single water meter CSV file with UnobservedComponents
@@ -1188,6 +1234,11 @@ def process_single_meter(
         )
         second_actuals = df_second["Diff"].values.astype(float)
         second_residuals = np.abs(second_actuals - second_predictions)
+        
+        # Per-sensor consumption magnitude for the band floor (injection-free).
+        sec_nz = second_actuals[second_actuals > 0]
+        signal_scale = float(np.median(sec_nz)) if sec_nz.size else np.nan
+        result["signal_scale"] = signal_scale
 
         if verbose:
             logger.info(f"Reference residuals computed for {result['filename']}, injecting anomalies...")
@@ -1220,7 +1271,11 @@ def process_single_meter(
             daily_period_steps=daily_period_steps,
             k_positions=k_positions,
             z_threshold=threshold_z_score,
+            signal_scale=signal_scale,
+            sigma_floor_frac_global=sigma_floor_frac_global,
+            sigma_floor_frac_scale=sigma_floor_frac_scale,
         )
+        
 
         # Build results dataframe: scores applied to prediction residuals,
         # but statistics estimated from second training segment residuals,
@@ -1237,7 +1292,11 @@ def process_single_meter(
             threshold_z_score=threshold_z_score,
             threshold_z_score_robust=threshold_z_score_robust,
             save_detection_bands=save_detection_bands,
+            signal_scale=signal_scale,
+            sigma_floor_frac_global=sigma_floor_frac_global,
+            sigma_floor_frac_scale=sigma_floor_frac_scale,
         )
+        
 
         result["z_scores"] = predictions_df["z_score"].tolist()
 
@@ -1295,6 +1354,14 @@ def process_single_meter(
         result["naive_mae_seasonal_second"] = mase["naive_mae_seasonal"]
         result["mase"] = mase["mase"]                    # lag-1 scaled
         result["mase_seasonal"] = mase["mase_seasonal"]  # seasonal-naive scaled (headline)
+        
+        # Injection-free predictability: model error on the clean second
+        # segment vs seasonal-naive on the same segment.
+        nm = result.get("naive_mae_seasonal_second")
+        result["mase_seasonal_clean"] = (
+            float(np.nanmean(second_residuals)) / nm
+            if nm and np.isfinite(nm) and nm > 0 else np.nan
+        )
 
         # ===================================================================
         # METRICS
@@ -1489,7 +1556,7 @@ def main():
 
     logger.info(f"Loaded {len(csv_filepaths)} CSV filepaths")
 
-    output_csv = f"./results/6_weeks_results_seasonal_uc_{args.samples}_seed_42_clipped_tree_timeout_120_daily_weekly_fourier_z_score_adaptive_test_anomalies_3_5.csv"
+    output_csv = f"./results/6_weeks_results_seasonal_uc_{args.samples}_seed_42_clipped_tree_timeout_120_daily_weekly_fourier_z_score_adaptive_test_anomalies.csv"
 
     _ = process_batch(
         csv_filepaths,
