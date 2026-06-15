@@ -36,6 +36,8 @@ import sys
 import json
 import argparse
 
+import pandas as pd
+
 import shared
 
 # Statuses that mean "the reading was rejected and state is unchanged" — no save.
@@ -43,9 +45,14 @@ _NO_STATE_CHANGE = {"skipped_early", "skipped_duplicate", "invalid"}
 
 
 def predict_one(meter_id, timestamp, hodnota, state_dir,
+                timezone=None, ambiguous="infer", nonexistent="NaT",
                 z_threshold_override=None, persist=True):
     """Process one reading and return a record dict. Persists updated state
-    unless the reading was rejected or persist=False."""
+    unless the reading was rejected or persist=False.
+
+    `timestamp` may be a naive *local* time (converted using the meter's stored
+    timezone, DST-aware) or an already tz-aware / UTC string (used directly).
+    """
     meter_dir = os.path.join(state_dir, str(meter_id))
 
     if not os.path.exists(os.path.join(meter_dir, shared.MODEL_FILE)):
@@ -57,7 +64,20 @@ def predict_one(meter_id, timestamp, hodnota, state_dir,
         }
 
     det = shared.UCStreamingDetector.load(meter_dir, z_threshold_override=z_threshold_override)
-    rec = det.step(timestamp, hodnota)
+
+    # Local -> UTC using the timezone the model was trained with (overridable).
+    tz = timezone or det.timezone
+    t_utc = shared.localize_to_utc(timestamp, timezone=tz,
+                                   ambiguous=ambiguous, nonexistent=nonexistent)[0]
+    if pd.isna(t_utc):
+        return {
+            "status": "invalid_timestamp",
+            "meter_id": str(meter_id),
+            "flag": False,
+            "message": f"Timestamp '{timestamp}' is ambiguous/nonexistent in {tz}; skipped.",
+        }
+
+    rec = det.step(t_utc, hodnota)
     rec["meter_id"] = str(meter_id)
 
     if persist and rec["status"] not in _NO_STATE_CHANGE:
@@ -81,6 +101,9 @@ def main():
     p.add_argument("--timestamp", required=True, help="ISO-8601 timestamp of the reading.")
     p.add_argument("--hodnota", required=True, help="Cumulative meter reading (use 'nan' if missing).")
     p.add_argument("--state-dir", default="./state")
+    p.add_argument("--timezone", default=None,
+                   help="Local timezone of the timestamp (default: the one the model was trained with). "
+                        "Ignored if the timestamp is already tz-aware.")
     p.add_argument("--z-threshold", type=float, default=None,
                    help="Override the stored z-score threshold (optional).")
     args = p.parse_args()
@@ -90,6 +113,7 @@ def main():
         timestamp=args.timestamp,
         hodnota=_parse_hodnota(args.hodnota),
         state_dir=args.state_dir,
+        timezone=args.timezone,
         z_threshold_override=args.z_threshold,
     )
     print(json.dumps(rec))

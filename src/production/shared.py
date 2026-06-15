@@ -113,6 +113,100 @@ def compute_k_positions(daily_period_steps, k_hours=2.0, min_k=2):
     return max(min_k, int(round(k_hours * daily_period_steps / 24)))
 
 
+# ==========================================================================
+# SENSOR QUALITY GATE
+# ==========================================================================
+# Default accept thresholds. Initial (fresh) fits are held to a stricter bar;
+# retrains (warm-started, sensor already in service) are relaxed so a sensor
+# is not churned in and out of service on a marginal refit.
+QUALITY_DEFAULTS = {
+    "fs_min_initial": 0.5,        "fs_min_retrain": 0.6,
+    "mase_max_initial": 0.95,     "mase_max_retrain": 1.0,
+    "fill_max_pct_initial": 10.0, "fill_max_pct_retrain": 15.0,
+}
+
+
+def resolve_quality_thresholds(is_retrain, overrides=None):
+    """Pick the active thresholds (initial vs retrain), with optional overrides
+    of any QUALITY_DEFAULTS key."""
+    d = dict(QUALITY_DEFAULTS)
+    if overrides:
+        d.update({k: v for k, v in overrides.items() if v is not None})
+    suffix = "retrain" if is_retrain else "initial"
+    return {
+        "fs_min": float(d[f"fs_min_{suffix}"]),
+        "mase_max": float(d[f"mase_max_{suffix}"]),
+        "fill_max_pct": float(d[f"fill_max_pct_{suffix}"]),
+        "is_retrain": bool(is_retrain),
+    }
+
+
+def quality_gate_failures(thr, *, fill_pct=None, f_s=None, mase=None):
+    """Return a list of human-readable failure reasons for whichever metrics are
+    supplied (None = not evaluated at this stage). A non-finite (NaN) metric is
+    treated as a failure, since the sensor's suitability cannot be confirmed.
+
+    Pass/fail rules (accept requires the opposite):
+      fill_pct < fill_max_pct,  f_s > fs_min,  mase < mase_max
+    """
+    reasons = []
+    if fill_pct is not None:
+        if not np.isfinite(fill_pct) or fill_pct >= thr["fill_max_pct"]:
+            shown = f"{fill_pct:.1f}%" if np.isfinite(fill_pct) else "NaN"
+            reasons.append(f"fill_pct {shown} not < {thr['fill_max_pct']}%")
+    if f_s is not None:
+        if not np.isfinite(f_s) or f_s <= thr["fs_min"]:
+            shown = f"{f_s:.3f}" if np.isfinite(f_s) else "NaN"
+            reasons.append(f"f_s {shown} not > {thr['fs_min']}")
+    if mase is not None:
+        if not np.isfinite(mase) or mase >= thr["mase_max"]:
+            shown = f"{mase:.3f}" if np.isfinite(mase) else "NaN"
+            reasons.append(f"mase {shown} not < {thr['mase_max']}")
+    return reasons
+
+
+def localize_to_utc(ts_like, timezone="Europe/Prague", ambiguous="infer", nonexistent="NaT"):
+    """
+    Convert naive *local* timestamps to tz-aware UTC, DST-aware. Mirrors the
+    project's batch add_utc_timestamp:
+      - ambiguous (autumn fall-back overlap): inferred from order where possible;
+        rows that cannot be resolved -> NaT;
+      - nonexistent (spring-forward gap): -> NaT.
+    Inputs that are already tz-aware are converted to UTC directly (no
+    localization). Accepts a scalar, list, Series, or ndarray and always returns
+    a UTC DatetimeIndex (with NaT for unresolvable entries).
+    """
+    idx = pd.to_datetime(np.atleast_1d(ts_like))
+    if not isinstance(idx, pd.DatetimeIndex):
+        idx = pd.DatetimeIndex(idx)
+
+    # Already tz-aware (e.g. ISO string with offset or 'Z') -> just convert.
+    if idx.tz is not None:
+        return idx.tz_convert("UTC")
+
+    try:
+        loc = idx.tz_localize(timezone, ambiguous=ambiguous, nonexistent=nonexistent)
+    except Exception:
+        # Vectorized 'infer' failed (e.g. data begins inside the ambiguous hour).
+        # Fall back per row: non-ambiguous rows localize fine; the rest -> NaT.
+        vals = []
+        for t in idx:
+            try:
+                vals.append(
+                    pd.DatetimeIndex([t]).tz_localize(
+                        timezone, ambiguous=ambiguous, nonexistent=nonexistent
+                    )[0]
+                )
+            except Exception:
+                vals.append(pd.NaT)
+        loc = pd.DatetimeIndex(vals)
+
+    if loc.tz is None:
+        # all-NaT naive index -> mark as UTC NaT
+        return loc.tz_localize("UTC")
+    return loc.tz_convert("UTC")
+
+
 def structural_signature(periodicity_seconds, daily_period_steps, weekly_period_steps, freq_seasonal):
     """A stable string identifying the model's structural shape. Warm-start from a
     previous fit is only valid when this is unchanged (same state dimension and
@@ -227,7 +321,8 @@ class UCStreamingDetector:
                  means_per_pos, stds_per_pos, global_mean, global_std,
                  periodicity_seconds, tolerance_percentage,
                  daily_period_steps, weekly_period_steps, k_positions, z_threshold,
-                 x, P, state_time, last_real_hodnota, outage_cap_steps=None):
+                 x, P, state_time, last_real_hodnota, outage_cap_steps=None,
+                 timezone="Europe/Prague", negative_diff_tol=0.002):
         self.T = np.asarray(T, dtype=float)
         self.Z = np.asarray(Z, dtype=float)
         self.H = np.asarray(H, dtype=float)
@@ -246,6 +341,8 @@ class UCStreamingDetector:
         self.k_positions = int(k_positions)
         self.z_threshold = float(z_threshold)
         self.outage_cap_steps = int(outage_cap_steps) if outage_cap_steps else self.weekly_period_steps
+        self.timezone = timezone
+        self.negative_diff_tol = float(negative_diff_tol)
 
         self.x = np.asarray(x, dtype=float).reshape(-1)
         self.P = np.asarray(P, dtype=float)
@@ -280,6 +377,8 @@ class UCStreamingDetector:
             state_time=pd.Timestamp(float(state["state_time_epoch"]), unit="s", tz="UTC"),
             last_real_hodnota=float(state["last_real_hodnota"]),
             outage_cap_steps=cfg.get("outage_cap_steps"),
+            timezone=cfg.get("timezone", "Europe/Prague"),
+            negative_diff_tol=cfg.get("negative_diff_tol", 0.002),
         )
 
     def save_state(self, meter_dir):
@@ -383,17 +482,24 @@ class UCStreamingDetector:
         n_missing = n_periods - 1
         diff_new = hodnota_new - self.last_real_hodnota
 
-        # --- meter reset / rollover ---------------------------------------
+        # --- negative diff handling ---------------------------------------
+        # Tiny negative (< tol) is meter-reading rounding noise -> treat as zero
+        # consumption and process normally. A larger negative is a rollback /
+        # meter reset -> drop the reading (no model update, no flag) but
+        # rebaseline so subsequent diffs are computed against the new value.
         if diff_new < 0:
-            for _ in range(n_periods):
-                self._kf_predict()
-                self._commit_no_update()
-            self.state_time = t_new
-            self.last_real_hodnota = hodnota_new
-            y_next, lower, upper = self._next_step_band()
-            rec.update(status="reset", diff=diff_new,
-                       pred_next=y_next, lower_band_next=lower, upper_band_next=upper)
-            return rec
+            if diff_new > -self.negative_diff_tol:
+                diff_new = 0.0
+            else:
+                for _ in range(n_periods):
+                    self._kf_predict()
+                    self._commit_no_update()
+                self.state_time = t_new
+                self.last_real_hodnota = hodnota_new
+                y_next, lower, upper = self._next_step_band()
+                rec.update(status="reset", diff=diff_new,
+                           pred_next=y_next, lower_band_next=lower, upper_band_next=upper)
+                return rec
 
         # --- outage handling ----------------------------------------------
         outage = n_missing > self.outage_cap_steps

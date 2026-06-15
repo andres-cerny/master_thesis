@@ -36,7 +36,9 @@ import pandas as pd
 from statsmodels.tsa.statespace.structural import UnobservedComponents
 
 # resample.py ships with the project; make sure it is importable.
-from resample import fill_gaps_with_periodicity_adaptive
+from gap_resample import fill_gaps_with_periodicity_adaptive
+# series_diagnostics.py ships with the project (seasonal strength + MASE).
+from series_diagnostics import compute_seasonal_diagnostics, compute_mase
 
 import shared
 
@@ -86,21 +88,56 @@ def train(meter_id, csv_path, state_dir,
           harmonics_daily=2, harmonics_weekly=2,
           k_hours=2.0, min_k_positions=2,
           z_threshold=3.5, tolerance_percentage=10.0,
+          timestamp_col="timestamp", hodnota_col="hodnota",
+          timezone="Europe/Prague",
+          apply_quality_gate=True, mase_metric="mase_seasonal",
+          quality_overrides=None,
+          negative_diff_tol=0.002,
           verbose=False):
 
     meter_dir = os.path.join(state_dir, str(meter_id))
 
     # ------------------------------------------------------------------
-    # Load + resample
+    # Load, standardize column names, convert local time -> UTC
     # ------------------------------------------------------------------
     df = pd.read_csv(csv_path)
-    for col in ("timestamp_utc", "hodnota"):
-        if col not in df.columns:
-            raise ValueError(f"Missing required column '{col}'. Have: {df.columns.tolist()}")
-    df["timestamp_utc"] = pd.to_datetime(df["timestamp_utc"], utc=True)
-    df = df.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc").reset_index(drop=True)
+    if timestamp_col not in df.columns:
+        raise ValueError(f"Timestamp column '{timestamp_col}' not found. Have: {df.columns.tolist()}")
+    if hodnota_col not in df.columns:
+        raise ValueError(f"Value column '{hodnota_col}' not found. Have: {df.columns.tolist()}")
+
+    # Rename to the canonical internal names used throughout the pipeline.
+    # Drop any pre-existing canonical column FIRST, so the rename can't create a
+    # duplicate. Sensor files often still carry a 'timestamp_utc' left over from
+    # earlier preprocessing; renaming 'timestamp' -> 'timestamp_utc' on top of it
+    # would make df['timestamp_utc'] a DataFrame and break the conversion.
+    rename = {}
+    drop_cols = []
+    if hodnota_col != "hodnota":
+        rename[hodnota_col] = "hodnota"
+        if "hodnota" in df.columns:
+            drop_cols.append("hodnota")
+    if timestamp_col != "timestamp_utc":
+        rename[timestamp_col] = "timestamp_utc"
+        if "timestamp_utc" in df.columns:
+            drop_cols.append("timestamp_utc")
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    df = df.rename(columns=rename)
+
+    # DST-aware conversion (mirrors the batch add_utc_timestamp). tz-aware input
+    # passes through; ambiguous/nonexistent local times become NaT and are dropped.
+    df["timestamp_utc"] = shared.localize_to_utc(df["timestamp_utc"], timezone=timezone)
+    n_before = len(df)
+    df = df.dropna(subset=["timestamp_utc"]).sort_values("timestamp_utc")
+    # Enforce strictly increasing timestamps. Sorting fixes out-of-order arrivals;
+    # dropping exact duplicates removes the zero/negative gaps that otherwise make
+    # the resampler try to insert a negative number of rows ("'shape' elements
+    # cannot be negative").
+    df = df.drop_duplicates(subset="timestamp_utc", keep="first").reset_index(drop=True)
+    n_dropped = n_before - len(df)
     if len(df) < 2:
-        raise ValueError("Input series too short (len < 2).")
+        raise ValueError("Input series too short (len < 2) after timestamp conversion.")
 
     df_res, diag = fill_gaps_with_periodicity_adaptive(df, timestamp_col="timestamp_utc")
     periodicity = float(diag.get("periodicity_used_seconds", 0) or 0)
@@ -111,6 +148,14 @@ def train(meter_id, csv_path, state_dir,
     # Recompute it here if the resampler did not carry it through.
     if "Diff" not in df_res.columns:
         df_res["Diff"] = df_res["hodnota"].diff()
+
+    # Clean negative diffs (meter rollback / reading noise), matching the batch
+    # convention: |neg| < tol -> 0 (rounding), larger neg -> NaN (dropped, so the
+    # Kalman filter skips it just like a gap).
+    _d = df_res["Diff"]
+    df_res["Diff"] = _d.mask((_d < 0) & (_d > -negative_diff_tol), 0.0)
+    _d = df_res["Diff"]
+    df_res["Diff"] = _d.mask(_d <= -negative_diff_tol, np.nan)
 
     daily_steps = int(round(24 * 3600 / periodicity))
     if daily_steps < 2:
@@ -143,6 +188,50 @@ def train(meter_id, csv_path, state_dir,
     # ------------------------------------------------------------------
     sig = shared.structural_signature(periodicity, daily_steps, weekly_steps, freq_seasonal)
     init_mean, init_cov = shared.warmstart_state(meter_dir, sig)
+    is_retrain = init_mean is not None  # a structurally-compatible prior exists
+    thr = shared.resolve_quality_thresholds(is_retrain, quality_overrides)
+
+    # ------------------------------------------------------------------
+    # Quality gate — PRE-TRAIN (cheap: rejects before the expensive MLE)
+    #   fill_pct : share of resampled rows that are synthetic gap-fills
+    #   f_s      : daily seasonal strength (Wang-Smith-Hyndman) on clean Diff
+    # ------------------------------------------------------------------
+    fill_pct = 100.0 * float(pd.isna(df_res["hodnota"]).mean())
+
+    # Seasonal strength needs enough *real* points to support the periods it
+    # decomposes on. A very sparse/flat meter (e.g. 103459, 103475) can have a
+    # 4-week slice that, after gap-fill + negative-diff cleaning, holds fewer
+    # valid points than ~2 weekly cycles; the decomposition then does a
+    # length-minus-period computation that goes negative ("'shape' elements
+    # cannot be negative"). Treat that as "no usable seasonality" -> NaN f_s,
+    # which the quality gate already rejects, rather than crashing the meter.
+    diff_vals = df_res["Diff"].values
+    n_valid = int(np.count_nonzero(~np.isnan(diff_vals)))
+    if n_valid < 2 * daily_steps:
+        seas = {"f_s_daily": float("nan"), "f_s_weekly": None}
+    else:
+        try:
+            seas = compute_seasonal_diagnostics(diff_vals, daily_steps, weekly_steps)
+        except Exception as e:
+            if verbose:
+                print(f"[{meter_id}] seasonal diagnostics failed ({e!r}); "
+                      f"treating f_s as NaN (n_valid={n_valid}).")
+            seas = {"f_s_daily": float("nan"), "f_s_weekly": None}
+    f_s_daily = float(seas.get("f_s_daily")) if seas.get("f_s_daily") is not None else float("nan")
+    f_s_weekly = seas.get("f_s_weekly")
+
+    pre_reasons = shared.quality_gate_failures(thr, fill_pct=fill_pct, f_s=f_s_daily)
+    if apply_quality_gate and pre_reasons:
+        result = {
+            "meter_id": str(meter_id), "status": "rejected", "accepted": False,
+            "stage": "pre_train", "reasons": pre_reasons, "is_retrain": is_retrain,
+            "thresholds": thr,
+            "metrics": {"fill_pct": fill_pct, "f_s_daily": f_s_daily,
+                        "f_s_weekly": f_s_weekly, "mase": None, "mase_seasonal": None},
+        }
+        if verbose:
+            print(json.dumps(result, indent=2, default=str))
+        return result
 
     model_fit = _build_model(df_fit["Diff"].values, freq_seasonal, stochastic_freq_seasonal)
     if init_mean is not None and init_cov is not None and init_mean.shape[0] == model_fit.k_states:
@@ -186,6 +275,28 @@ def train(meter_id, csv_path, state_dir,
     ref_resid = np.abs(ref_actual - ref_pred)
 
     # ------------------------------------------------------------------
+    # Quality gate — POST-TRAIN (needs the fitted model): MASE skill score.
+    #   model MAE on the reference (out-of-sample if holdout) one-step errors,
+    #   scaled by the in-sample naive MAE on the fit Diff.
+    # ------------------------------------------------------------------
+    mase_d = compute_mase(ref_actual, ref_pred, df_fit["Diff"].values, m_seasonal=daily_steps)
+    mase_val = mase_d.get(mase_metric)
+    post_reasons = shared.quality_gate_failures(thr, mase=mase_val)
+    if apply_quality_gate and post_reasons:
+        result = {
+            "meter_id": str(meter_id), "status": "rejected", "accepted": False,
+            "stage": "post_train", "reasons": post_reasons, "is_retrain": is_retrain,
+            "thresholds": thr,
+            "metrics": {"fill_pct": fill_pct, "f_s_daily": f_s_daily,
+                        "f_s_weekly": f_s_weekly,
+                        "mase": mase_d.get("mase"), "mase_seasonal": mase_d.get("mase_seasonal"),
+                        "mase_metric": mase_metric},
+        }
+        if verbose:
+            print(json.dumps(result, indent=2, default=str))
+        return result  # fitted but NOT persisted -> sensor not put into service
+
+    # ------------------------------------------------------------------
     # z-score statistics (global + per position on the daily cycle)
     # ------------------------------------------------------------------
     ref_positions = shared.compute_position_in_period(
@@ -219,6 +330,8 @@ def train(meter_id, csv_path, state_dir,
         "meter_id": str(meter_id),
         "periodicity_seconds": periodicity,
         "tolerance_percentage": float(tolerance_percentage),
+        "timezone": timezone,
+        "negative_diff_tol": float(negative_diff_tol),
         "daily_period_steps": int(daily_steps),
         "weekly_period_steps": int(weekly_steps),
         "freq_seasonal": freq_seasonal,
@@ -235,6 +348,16 @@ def train(meter_id, csv_path, state_dir,
         "holdout_days": float(holdout_days),
         "n_fit": int(len(df_fit)),
         "n_ref": int(len(ref_df)),
+        "n_dropped_bad_timestamp": int(n_dropped),
+        "is_retrain": bool(is_retrain),
+        "quality_gate_applied": bool(apply_quality_gate),
+        "quality_thresholds": thr,
+        "fill_pct": fill_pct,
+        "f_s_daily": f_s_daily,
+        "f_s_weekly": (None if f_s_weekly is None else float(f_s_weekly)),
+        "mase": mase_d.get("mase"),
+        "mase_seasonal": mase_d.get("mase_seasonal"),
+        "mase_metric": mase_metric,
         "trained_at": pd.Timestamp.utcnow().isoformat(),
     }
 
@@ -246,14 +369,31 @@ def train(meter_id, csv_path, state_dir,
         state_time=state_time, last_real_hodnota=last_real_hodnota,
     )
 
+    result = {
+        "meter_id": str(meter_id), "status": "success", "accepted": True,
+        "stage": None, "reasons": [], "is_retrain": is_retrain, "thresholds": thr,
+        "metrics": {"fill_pct": fill_pct, "f_s_daily": f_s_daily,
+                    "f_s_weekly": (None if f_s_weekly is None else float(f_s_weekly)),
+                    "mase": mase_d.get("mase"), "mase_seasonal": mase_d.get("mase_seasonal"),
+                    "mase_metric": mase_metric},
+        "config": config,
+    }
+
     if verbose:
         print(json.dumps({
             "meter_id": str(meter_id),
+            "status": "success",
+            "is_retrain": is_retrain,
             "periodicity_seconds": periodicity,
             "daily_period_steps": daily_steps,
             "k_positions": k_positions,
             "warm_started": warm,
             "converged": converged,
+            "fill_pct": round(fill_pct, 2),
+            "f_s_daily": (None if not np.isfinite(f_s_daily) else round(f_s_daily, 3)),
+            "mase": (None if mase_d.get("mase") is None else round(mase_d["mase"], 3)),
+            "mase_seasonal": (None if mase_d.get("mase_seasonal") is None
+                              else round(mase_d["mase_seasonal"], 3)),
             "global_mean": round(global_mean, 4),
             "global_std": round(global_std, 4),
             "state_time": pd.Timestamp(state_time).isoformat(),
@@ -261,7 +401,7 @@ def train(meter_id, csv_path, state_dir,
             "saved_to": meter_dir,
         }, indent=2))
 
-    return config
+    return result
 
 
 def main():
@@ -278,8 +418,34 @@ def main():
     p.add_argument("--min-k-positions", type=int, default=2)
     p.add_argument("--z-threshold", type=float, default=3.5)
     p.add_argument("--tolerance-percentage", type=float, default=10.0)
+    p.add_argument("--timestamp-col", default="timestamp", help="Name of the timestamp column in the CSV.")
+    p.add_argument("--hodnota-col", default="hodnota", help="Name of the meter-value column in the CSV.")
+    p.add_argument("--timezone", default="Europe/Prague", help="Local timezone of the raw timestamps.")
+    # ---- quality gate ----
+    p.add_argument("--no-quality-gate", action="store_true",
+                   help="Compute the quality metrics but do not reject any sensor.")
+    p.add_argument("--mase-metric", default="mase_seasonal", choices=["mase_seasonal", "mase"],
+                   help="Which MASE to gate on (default: seasonal-naive scaled).")
+    p.add_argument("--negative-diff-tol", type=float, default=0.002,
+                   help="Negative Diff magnitude below which it's treated as 0 (rounding); "
+                        "at or above it the reading is dropped (NaN/skip).")
+    p.add_argument("--fs-min-initial", type=float, default=None)
+    p.add_argument("--fs-min-retrain", type=float, default=None)
+    p.add_argument("--mase-max-initial", type=float, default=None)
+    p.add_argument("--mase-max-retrain", type=float, default=None)
+    p.add_argument("--fill-max-pct-initial", type=float, default=None)
+    p.add_argument("--fill-max-pct-retrain", type=float, default=None)
     p.add_argument("--verbose", action="store_true")
     args = p.parse_args()
+
+    quality_overrides = {
+        "fs_min_initial": args.fs_min_initial,
+        "fs_min_retrain": args.fs_min_retrain,
+        "mase_max_initial": args.mase_max_initial,
+        "mase_max_retrain": args.mase_max_retrain,
+        "fill_max_pct_initial": args.fill_max_pct_initial,
+        "fill_max_pct_retrain": args.fill_max_pct_retrain,
+    }
 
     train(
         meter_id=args.meter_id,
@@ -292,6 +458,13 @@ def main():
         min_k_positions=args.min_k_positions,
         z_threshold=args.z_threshold,
         tolerance_percentage=args.tolerance_percentage,
+        timestamp_col=args.timestamp_col,
+        hodnota_col=args.hodnota_col,
+        timezone=args.timezone,
+        apply_quality_gate=not args.no_quality_gate,
+        mase_metric=args.mase_metric,
+        quality_overrides=quality_overrides,
+        negative_diff_tol=args.negative_diff_tol,
         verbose=True,
     )
 
