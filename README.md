@@ -9,6 +9,7 @@
 | **Programme** | Informatics — Knowledge Engineering |
 | **Department** | Department of Applied Mathematics |
 | **Year** | 2026 |
+| **Grade** | A |
 
 ---
 
