@@ -130,18 +130,20 @@ def cell_label(archetype, depth, duration_h):
 
 def _job(args):
     """Top-level so ProcessPoolExecutor can pickle it."""
-    filepath, archetype, depth, duration_h, variant, threshold_z_score = args
+    (filepath, archetype, depth, duration_h, variant, threshold_z_score,
+     sustained) = args
     plan = ai.InjectionPlan(archetype=archetype, depth=depth, duration_h=duration_h)
     return uv.run_variant(filepath, variant, injection_plan=plan,
-                          threshold_z_score=threshold_z_score)
+                          threshold_z_score=threshold_z_score,
+                          sustained_detectors=sustained)
 
 
 def run(files, cells, variant, workers, per_file_timeout, out_dir,
-        threshold_z_score=3.5):
+        threshold_z_score=3.5, sustained_detectors=False):
     out_dir = Path(out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    jobs = [(f, a, dep, dur, variant, threshold_z_score)
+    jobs = [(f, a, dep, dur, variant, threshold_z_score, sustained_detectors)
             for (a, dep, dur) in cells for f in files]
     logger.info("Running %d jobs (%d files x %d cells) on %d workers",
                 len(jobs), len(files), len(cells), workers)
@@ -152,7 +154,7 @@ def run(files, cells, variant, workers, per_file_timeout, out_dir,
     with ProcessPoolExecutor(max_workers=workers) as ex:
         futures = {ex.submit(_job, j): j for j in jobs}
         for fut in tqdm(as_completed(futures), total=len(futures), desc="runs"):
-            filepath, archetype, depth, duration_h, _v, _z = futures[fut]
+            filepath, archetype, depth, duration_h, _v, _z, _s = futures[fut]
             fname = Path(filepath).stem
             label = cell_label(archetype, depth, duration_h)
             try:
@@ -254,7 +256,18 @@ def _surface(summary, events_df):
     detection); falls back to per-sensor aggregates otherwise.
     """
     if len(events_df):
-        return _apply_null_correction(em.detection_surface(events_df))
+        surf = _apply_null_correction(em.detection_surface(events_df))
+        # When the detectors ran, carry their event recall onto the same rows so
+        # the gain is readable in one table instead of two.
+        ok = summary[summary.get("status") == "success"] if len(summary) else summary
+        if len(ok) and "sust_event_recall" in ok.columns:
+            extra = (ok.groupby(["archetype", "depth", "duration_h"], dropna=False)
+                       .agg(sust_recall=("sust_event_recall", "mean"),
+                            comb_recall=("comb_event_recall", "mean"))
+                       .reset_index())
+            surf = surf.merge(extra, on=["archetype", "depth", "duration_h"],
+                              how="left")
+        return surf
 
     ok = summary[summary.get("status") == "success"] if len(summary) else summary
     if not len(ok) or "event_recall" not in ok.columns:
@@ -276,7 +289,7 @@ def _report(summary, surface, elapsed, out_dir):
     if len(surface):
         cols = [c for c in ("archetype", "depth", "duration_h", "n_events",
                             "detection_rate", "null_rate", "excess_detection_rate",
-                            "ttd_readings_median")
+                            "sust_recall", "comb_recall", "ttd_readings_median")
                 if c in surface.columns]
         logger.info("DETECTION SURFACE:\n%s", surface[cols].to_string(index=False))
 
@@ -309,6 +322,11 @@ def main():
     ap.add_argument("--variant", default="baseline",
                     help="Model variant from uc_variants.VARIANTS (default: baseline).")
     ap.add_argument("--threshold-z-score", type=float, default=3.5)
+    ap.add_argument("--sustained-detectors", action="store_true",
+                    help="Also run the read-only sustained detectors and score "
+                         "the same events against their union (sust_*/comb_* "
+                         "columns). Off by default so the surface measures the "
+                         "z-score detector alone.")
     ap.add_argument("--archetypes", nargs="+", default=sorted(ai.ARCHETYPES))
     ap.add_argument("--depths", nargs="+", type=float, default=list(DEFAULT_DEPTHS))
     ap.add_argument("--durations", nargs="+", type=float,
@@ -320,7 +338,8 @@ def main():
     logger.info("%d files x %d cells", len(files), len(cells))
 
     run(files, cells, args.variant, args.workers, args.per_file_timeout,
-        args.out_dir, threshold_z_score=args.threshold_z_score)
+        args.out_dir, threshold_z_score=args.threshold_z_score,
+        sustained_detectors=args.sustained_detectors)
     return 0
 
 

@@ -73,6 +73,7 @@ from helper_scripts.calculate_metrics import calculate_metrics
 from helper_scripts.create_anomalies import inject_spike_anomalies_diff
 from helper_scripts import anomaly_injection as ai
 from helper_scripts import event_metrics as em
+from helper_scripts import sustained_detectors as sd
 from helper_scripts.series_diagnostics import (
     compute_intermittency,
     compute_seasonal_diagnostics,
@@ -524,12 +525,21 @@ def process_single_meter(
     verbose=False,
     return_predictions=False,
     injection_plan=None,
+    sustained_detectors=False,
+    flag_run_threshold=3,
+    cusum_k=0.5,
+    cusum_h=5.0,
 ):
     """Run one meter end-to-end under a given variant configuration.
 
     Defaults (`transform="raw"`, `harmonics_daily_max=None`, `signed_bands=False`,
     `mask_z_threshold=None` -> equals detection threshold, `injection_plan=None`
     -> the original spike injector) reproduce the baseline script exactly.
+
+    `sustained_detectors=True` additionally runs the read-only detectors in
+    `helper_scripts/sustained_detectors.py`. They add columns and counts; they
+    never alter `is_anomaly_predicted` or the masking rule, so the baseline
+    numbers are identical whether or not they are enabled.
 
     `injection_plan` is an `anomaly_injection.InjectionPlan` selecting one
     sustained archetype at a given depth and duration. It replaces the spike
@@ -551,6 +561,7 @@ def process_single_meter(
         "opt_signed_bands": bool(signed_bands),
         "opt_threshold_z_score": threshold_z_score,
         "opt_mask_z_threshold": mask_z_threshold,
+        "opt_sustained_detectors": bool(sustained_detectors),
     }
 
     try:
@@ -602,7 +613,7 @@ def process_single_meter(
         df_second_s = _transformed(df_second, tf)
 
         # ---- two-stage warm-start training ----------------------------------
-        last_state_mean, last_state_cov, _ = train_model(
+        last_state_mean, last_state_cov, theta_first = train_model(
             df_train=df_train_s, result=result,
             freq_seasonal=freq_seasonal,
             stochastic_freq_seasonal=stochastic_freq_seasonal,
@@ -701,6 +712,56 @@ def process_single_meter(
         result["z_scores"] = predictions_df["z_score"].tolist()
         result["labels"] = predictions_df["is_anomaly_actual"].tolist()
 
+        # ---- sustained detectors (opt-in, read-only) -------------------------
+        # Calibrated on the CLEAN calibration segment and stepped across the
+        # prediction segment one reading at a time. They emit their own columns
+        # and never touch is_anomaly_predicted or the masking rule, so switching
+        # them on cannot move the baseline numbers.
+        if sustained_detectors:
+            cal_signed = second_actual_s - second_pred_s   # signed, pre-fold
+            cal_pos = compute_position_in_period(
+                df_second["timestamp_utc"].values, periodicity_seconds,
+                daily_period_steps)
+            pred_pos = compute_position_in_period(
+                predictions_df["timestamp_utc"].values, periodicity_seconds,
+                daily_period_steps)
+            dets = sd.calibrate_all(
+                df_second["timestamp_utc"].values,
+                np.asarray(df_second["Diff"].values, dtype=float),
+                cal_signed,
+                cal_positions=cal_pos,
+                daily_steps=daily_period_steps,
+                flag_run_threshold=flag_run_threshold,
+                cusum_k=cusum_k, cusum_h=cusum_h,
+            )
+            det_df = sd.run_detectors(
+                dets,
+                predictions_df["timestamp_utc"].values,
+                predictions_df["actual"].values,
+                predictions_df["predicted"].values,
+                predictions_df["is_anomaly_predicted"].values.astype(bool),
+                positions=pred_pos,
+            )
+            for c in det_df.columns:
+                predictions_df[c] = det_df[c].values
+
+            result["n_sustained_alerts"] = int(det_df["sustained_alert"].sum())
+            result["n_stuck"] = int(det_df["stuck"].sum())
+            result["n_drift"] = int(det_df["drift"].sum())
+            result["n_seasonal_drift"] = int(det_df.get(
+                "seasonal_drift", pd.Series(dtype=bool)).sum())
+            result["n_anomaly_sustained"] = int(det_df["anomaly_sustained"].sum())
+            result["n_night_flow_elevated"] = int(det_df["night_flow_elevated"].sum())
+            result["stuck_threshold"] = int(dets["stuck"].threshold)
+            result["night_flow_baseline"] = float(dets["night"].baseline)
+
+        # ---- cross-fit drift (training-time diagnostic) ----------------------
+        result.update(sd.crossfit_drift(
+            theta_first, theta_second,
+            mase_first=result.get("mase_seasonal_first", np.nan),
+            mase_second=result.get("mase_seasonal", np.nan),
+        ))
+
         # ---- event-level results (only when a sustained plan was injected) ---
         # Point-wise recall treats a caught 48h leak as ~96% misses; event recall
         # and time-to-detect are what actually separate detectors here. Both
@@ -713,6 +774,25 @@ def process_single_meter(
                 periodicity_seconds=periodicity_seconds,
             )
             result.update(ev_summary)
+
+            # Same events scored against the sustained detectors' union, so the
+            # gain from adding them is a direct delta on one run rather than a
+            # comparison across two. Prefixed, never overwriting the z-score
+            # numbers above.
+            if sustained_detectors and "sustained_alert" in predictions_df.columns:
+                comb = (predictions_df["is_anomaly_predicted"].astype(bool)
+                        | predictions_df["sustained_alert"].astype(bool))
+                for key, flags_col in (("sust", predictions_df["sustained_alert"].astype(bool)),
+                                       ("comb", comb)):
+                    s_sum, _ = em.summarize_run(
+                        predictions_df["timestamp_utc"].values,
+                        flags_col.values,
+                        injected_events,
+                        periodicity_seconds=periodicity_seconds,
+                    )
+                    for k, v in s_sum.items():
+                        result[f"{key}_{k}"] = v
+
             result["events"] = [e.to_row() for e in injected_events]
             result["event_rows"] = ev_df.to_dict("records")
             result["injection_archetype"] = injection_plan.archetype

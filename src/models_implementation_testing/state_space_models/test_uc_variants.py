@@ -34,6 +34,7 @@ if _PARENT not in sys.path:
     sys.path.insert(0, _PARENT)
 from helper_scripts import anomaly_injection as ai
 from helper_scripts import event_metrics as em
+from helper_scripts import sustained_detectors as sdet
 
 DEFAULT_FIXTURES = "/home/user/uc-cem/testing_scripts/fixtures/real_segments"
 
@@ -538,6 +539,112 @@ def test_injection_is_read_only(files):
     return ok_all
 
 
+
+def test_sustained_detectors():
+    """Detector recurrences must be causal, calibrated, and honest."""
+    print("\n[14] sustained detectors")
+
+    # --- direction is recovered, and the fold's near-zero pathology is gone ---
+    st = sdet.SignedResidualStats(mu=0.0, sd=1.0)
+    check("direction: over", st.update(2.0, 1.0)["direction"] == "over")
+    check("direction: under", st.update(1.0, 2.0)["direction"] == "under")
+    check("signed z keeps sign", st.update(1.0, 2.0)["z_signed"] < 0)
+    check("perfect prediction scores ~0 signed",
+          abs(st.update(1.0, 1.0)["z_signed"]) < 1e-9)
+
+    # --- run counter escalates only after N consecutive ----------------------
+    rc = sdet.FlagRunCounter(threshold=3)
+    got = [rc.update(f)["anomaly_sustained"] for f in [1, 1, 1, 0, 1]]
+    check("run counter fires on the 3rd consecutive flag",
+          got == [False, False, True, False, False])
+
+    # --- stuck: threshold learned from the sensor's own idle behaviour -------
+    quiet = np.array([0.0] * 10 + [1.0] * 10)     # idles 10 in a row normally
+    busy = np.array([1.0] * 20)                   # never idles
+    d_quiet = sdet.StuckMeterDetector.calibrate(quiet)
+    d_busy = sdet.StuckMeterDetector.calibrate(busy)
+    check("stuck threshold adapts to the sensor",
+          d_quiet.threshold > d_busy.threshold,
+          f"quiet={d_quiet.threshold} busy={d_busy.threshold}")
+    fired = [d_busy.update(0.0)["stuck"] for _ in range(10)]
+    check("stuck fires on a never-idle sensor", any(fired))
+    d_busy.update(1.0)
+    check("stuck resets on consumption", d_busy.run == 0)
+    nan_det = sdet.StuckMeterDetector(max_zero_run=2)
+    nan_det.update(0.0)
+    before = nan_det.run
+    nan_det.update(np.nan)
+    check("a gap neither extends nor resets the zero run", nan_det.run == before)
+
+    # --- seasonal drift: fires under a sustained lift, not under noise -------
+    rng = np.random.default_rng(0)
+    daily = 24
+    pos = np.tile(np.arange(daily), 20)
+    base_profile = 1.0 + 0.5 * np.sin(2 * np.pi * np.arange(daily) / daily)
+    cal = base_profile[pos] + rng.normal(0, 0.05, pos.size)
+    det = sdet.SeasonalDriftDetector.calibrate(pos, cal, daily, k=0.5, h=5.0)
+
+    clean = base_profile[pos[:200]] + rng.normal(0, 0.05, 200)
+    n_clean = sum(det.update(pos[i], clean[i])["seasonal_drift"] for i in range(200))
+
+    det2 = sdet.SeasonalDriftDetector.calibrate(pos, cal, daily, k=0.5, h=5.0)
+    lifted = clean + 0.5
+    n_lift = sum(det2.update(pos[i], lifted[i])["seasonal_drift"] for i in range(200))
+    check("seasonal drift fires far more under a sustained lift",
+          n_lift > n_clean, f"lift={n_lift} clean={n_clean}")
+
+    # --- night flow: baseline is the MEDIAN daily minimum --------------------
+    ts = pd.date_range("2024-01-01", periods=24 * 6, freq="h", tz="UTC")
+    d = np.tile(np.concatenate([np.zeros(6) + 0.1, np.ones(18)]), 6)
+    nf = sdet.NightFlowTracker.calibrate(ts, d, factor=3.0)
+    check("night-flow baseline is the median daily minimum",
+          np.isclose(nf.baseline, 0.1), f"{nf.baseline}")
+
+    # --- the residual CUSUM is excluded from the union, deliberately --------
+    out = sdet.run_detectors(
+        sdet.calibrate_all(ts, d, np.zeros(len(d)),
+                           cal_positions=np.arange(len(d)) % 24, daily_steps=24),
+        ts, d, d, np.zeros(len(d), dtype=bool),
+        positions=np.arange(len(d)) % 24,
+    )
+    check("union excludes the residual CUSUM (it does not discriminate)",
+          bool(((out["drift"].astype(bool)) & (~out["sustained_alert"])).any())
+          or not out["drift"].any())
+    check("all detector columns present",
+          {"z_signed", "direction", "anomaly_sustained", "stuck", "drift",
+           "seasonal_drift", "night_flow_elevated",
+           "sustained_alert"} <= set(out.columns))
+
+    # --- cross-fit drift -----------------------------------------------------
+    cd = sdet.crossfit_drift([1.0, 2.0], [1.0, 2.0])
+    check("identical fits show zero drift", np.isclose(cd["theta_l2_delta"], 0.0))
+    cd2 = sdet.crossfit_drift([1.0, 2.0], [1.0, 4.0])
+    check("changed fits show positive drift", cd2["theta_l2_delta"] > 0)
+    return not _FAIL
+
+
+def test_detectors_are_read_only(files):
+    """Enabling the detectors must not move a single existing number."""
+    print("\n[15] detectors do not alter existing scoring")
+    ok_all = True
+    for f in files:
+        name = Path(f).stem
+        a = uv.run_variant(f, "baseline")
+        b = uv.run_variant(f, "baseline", sustained_detectors=True)
+        if not (require_success(a, f"{name}/off") and require_success(b, f"{name}/on")):
+            ok_all = False
+            continue
+        za = np.asarray(a["z_scores"], dtype=float)
+        zb = np.asarray(b["z_scores"], dtype=float)
+        ok_all &= check(f"{name}: z-scores unchanged by detectors",
+                        za.shape == zb.shape and np.allclose(za, zb, equal_nan=True,
+                                                             rtol=0, atol=0))
+        same = all(a.get(k) == b.get(k) for k in
+                   ("metric_pred_tp", "metric_pred_fp", "metric_pred_fn"))
+        ok_all &= check(f"{name}: tp/fp/fn unchanged by detectors", same)
+    return ok_all
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fixtures", default=DEFAULT_FIXTURES)
@@ -562,6 +669,8 @@ def main():
     test_event_metrics()
     test_null_control_correction()
     test_injection_is_read_only(files)
+    test_sustained_detectors()
+    test_detectors_are_read_only(files)
 
     print(f"\n{'=' * 60}")
     print(f"passed: {len(_PASS)}   failed: {len(_FAIL)}")

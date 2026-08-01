@@ -79,6 +79,11 @@ python run_sustained.py \
     --data-dir /home/user/uc-cem/testing_scripts/fixtures/real_segments \
     --out-dir ./results/sustained_smoke
 
+# 1b. same, with the sustained detectors scored alongside
+python run_sustained.py \
+    --data-dir /home/user/uc-cem/testing_scripts/fixtures/real_segments \
+    --out-dir ./results/sustained_smoke_det --sustained-detectors
+
 # 2. full test set
 python run_sustained.py \
     --data-dir ../../../data/sensor_data \
@@ -144,10 +149,81 @@ python analyze_variants.py --results ./results/sustained_baseline --sweep
 The runner also prints a **NEVER DETECTED** block listing every cell whose excess
 rate is zero. That block is the point of the exercise.
 
+## The detectors
+
+`--sustained-detectors` additionally runs the read-only detectors in
+`helper_scripts/sustained_detectors.py` and scores the same events against their
+union (`sust_*` columns) and against the union with the z-score (`comb_*`). Off
+by default, so the surface measures the existing detector alone.
+
+Each is a **scalar recurrence with explicit state** — one `update()` per reading,
+no lookahead. That is not stylistic: the production detector
+(`uc-cem/model/shared.py::UCStreamingDetector.step()`) handles one reading per
+call and persists state between calls, so a detector in this shape ports across
+as a field in `state.npz` and a few lines in `step()`. A pandas pass over the
+week would not port at all.
+
+| detector | signal | targets |
+|---|---|---|
+| `SignedResidualStats` | signed innovation | direction (over/under) |
+| `FlagRunCounter` | consecutive z-flags | sustained events |
+| `StuckMeterDetector` | run of zero `Diff` | frozen meter |
+| `SeasonalDriftDetector` | CUSUM vs **calibration profile** | slow leak |
+| `NightFlowTracker` | daily minimum `Diff` | slow leak |
+| `LeakDetector` | CUSUM vs **model residual** | *does not work — see below* |
+
+### The residual CUSUM does not work, and that is a finding
+
+The obvious design — CUSUM on the one-step-ahead residual — was implemented,
+measured, and **excluded from the alert union**. On the fixtures its firing count
+under an injected leak is *less than or equal to* its count under
+`null_control`, at every `(k, h)` tried:
+
+| k | h | null | leak 0.1 | leak 1.0 |
+|---|---|---|---|---|
+| 0.5 | 5 | 12 | 11 | 8 |
+| 0.5 | 10 | 4 | 4 | 2 |
+| 1.0 | 5 | 3 | 3 | 3 |
+| 1.0 | 20 | 0 | 0 | 0 |
+
+No tuning fixes this, because it is not a tuning problem. A one-step-ahead
+residual is the error of an *adaptive* predictor: the local level tracks the leak
+within a few readings, the residual returns to zero, and the CUSUM sees only a
+brief transient. **The fault erases its own evidence from the signal being
+monitored.**
+
+The two detectors that do work both avoid model residuals entirely.
+`SeasonalDriftDetector` compares against a per-position profile frozen at
+calibration time; `NightFlowTracker` watches raw daily minimum consumption. Both
+are immune to the level component re-baselining around the fault.
+
+The column is still emitted, so the result stays auditable rather than being
+quietly deleted.
+
+### Measured on the three fixtures
+
+| archetype | depth | z-recall | **sust** | resid CUSUM | seasonal | stuck | night |
+|---|---|---|---|---|---|---|---|
+| `null_control` | — | 0.33 | 0.67 | 12 | 18 | 10 | **0** |
+| `slow_leak` | 0.1 | 0.33 | **1.00** | 11 | 19 | 10 | **3** |
+| `slow_leak` | 0.5 | 0.33 | **1.00** | 9 | 23 | 10 | **3** |
+| `slow_leak` | 1.0 | 0.33 | **1.00** | 8 | 29 | 10 | **3** |
+| `frozen_meter` | — | 0.00 | **0.67** | 11 | 19 | **32** | 0 |
+| `zero_consumption` | — | 0.00 | **0.67** | 11 | 18 | **34** | 0 |
+
+Night flow separates cleanly (0 on the control, 3 on every leak depth) and
+seasonal drift rises monotonically with depth (18 → 19 → 23 → 29). The stuck
+detector triples on a frozen meter but carries a non-zero false-alarm count on
+the control, so its `tolerance_factor` is the knob to raise if alert volume
+matters more than sensitivity.
+
+Three fixtures is not a fleet. These numbers show the detectors respond to the
+right things; the fleet run is what sizes the false-alarm rate.
+
 ## Invariants
 
 Four properties this harness must not break. All are asserted in
-`test_uc_variants.py` (99 checks).
+`test_uc_variants.py` (120 checks).
 
 1. **Baseline equivalence.** `uc_variants` with default arguments reproduces the
    baseline script's z-scores bit-for-bit. `injection_plan=None` is a no-op.
@@ -157,7 +233,12 @@ Four properties this harness must not break. All are asserted in
    Verify: check [13].
 3. **Fixture CSVs are read-only.** Injection is in-memory on the DataFrame.
    Verify: check [13] compares file bytes before and after a run.
-4. **Split and resample logic untouched.** Injection happens post-resample, at
+4. **Detectors are read-only.** Enabling them changes no z-score and no
+   tp/fp/fn count; masking stays governed by `mask_z_threshold` alone. Changing
+   what freezes the Kalman state would change the state trajectory and therefore
+   the existing detector, invalidating every before/after comparison.
+   Verify: check [15].
+5. **Split and resample logic untouched.** Injection happens post-resample, at
    the same point in `process_single_meter` the spike injector always occupied,
    so window selection stays seeded on `int(filename)` and cross-cell comparison
    stays paired per sensor.
