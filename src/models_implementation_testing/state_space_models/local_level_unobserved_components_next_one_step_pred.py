@@ -781,7 +781,9 @@ def predict_model_online(df_predict, result, freq_seasonal, stochastic_freq_seas
             x_prior = T @ x
             P_prior = T @ P @ T.T + Q_full
 
-            y_hat = float(Z @ x_prior)
+            # .item() not float(): Z @ x_prior has shape (1,), and NumPy >= 2
+            # refuses float() on any non-0-d array. Value-identical.
+            y_hat = (Z @ x_prior).item()
             predictions[t] = max(y_hat, 0.0)   # clip negatives
 
             y_t = y_pred_segment[t]
@@ -814,7 +816,7 @@ def predict_model_online(df_predict, result, freq_seasonal, stochastic_freq_seas
                 x = x_prior
                 P = P_prior
             else:
-                S = float(Z @ P_prior @ Z.T + H)        # innovation variance
+                S = (Z @ P_prior @ Z.T + H).item()      # innovation variance
                 K = (P_prior @ Z.T) / S                 # Kalman gain (k, 1)
                 innovation = y_t - y_hat
                 x = x_prior + K.flatten() * innovation

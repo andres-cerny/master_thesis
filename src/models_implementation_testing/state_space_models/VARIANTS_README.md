@@ -134,6 +134,10 @@ the local level.
 
 ## Known follow-up: the sustained-deficit class
 
+> **Now implemented** — see [`SUSTAINED_README.md`](SUSTAINED_README.md) for the
+> injector, the depth x duration detection surface, and the null control that
+> separates real detection from coincidental alarms.
+
 A local-level model absorbs sustained shifts *by design* — that is what the
 level component is for — and it gets **worse as the deficit gets shallower**,
 since small residuals never trip the masking threshold that would freeze the

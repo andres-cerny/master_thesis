@@ -29,6 +29,12 @@ import local_level_unobserved_components_next_one_step_pred as base
 import uc_variants as uv
 import analyze_variants as av
 
+_PARENT = os.path.normpath(os.path.join(_HERE, ".."))
+if _PARENT not in sys.path:
+    sys.path.insert(0, _PARENT)
+from helper_scripts import anomaly_injection as ai
+from helper_scripts import event_metrics as em
+
 DEFAULT_FIXTURES = "/home/user/uc-cem/testing_scripts/fixtures/real_segments"
 
 _PASS, _FAIL = [], []
@@ -38,6 +44,20 @@ def check(name, ok, detail=""):
     (_PASS if ok else _FAIL).append(name)
     print(f"  [{'PASS' if ok else 'FAIL'}] {name}" + (f" — {detail}" if detail else ""))
     return ok
+
+
+def require_success(result, label):
+    """Gate every per-sensor assertion on the run having actually succeeded.
+
+    Without this, a run that fails for an environmental reason (a NumPy 2
+    incompatibility did exactly this) is silently `continue`d, and comparisons
+    between two failed results report PASS. The suite then claims to be green
+    while measuring nothing. A failed run is a test failure, not a skip.
+    """
+    if result.get("status") == "success":
+        return True
+    check(f"{label}: run succeeded", False, str(result.get("error"))[:120])
+    return False
 
 
 # ============================================================================
@@ -59,7 +79,8 @@ def test_baseline_equivalence(files):
         if a["status"] != b["status"]:
             all_ok &= check(f"{name}: status", False, f'{a["status"]} vs {b["status"]}')
             continue
-        if a["status"] != "success":
+        if not require_success(a, f"{name}/base"):
+            all_ok = False
             continue
 
         za = np.asarray(a.get("z_scores", []), dtype=float)
@@ -142,7 +163,8 @@ def test_sweep_consistency(files):
     for variant in ("baseline", "signed", "log1p"):
         for f in files:
             r = uv.run_variant(f, variant)
-            if r["status"] != "success":
+            if not require_success(r, f"{Path(f).stem}/{variant}"):
+                ok_all = False
                 continue
             z = np.asarray(r["z_scores"], dtype=float)
             y = np.asarray(r["labels"], dtype=int)
@@ -170,7 +192,8 @@ def test_signed_semantics(files):
     ok_all = True
     for f in files:
         r = uv.run_variant(f, "signed")
-        if r["status"] != "success":
+        if not require_success(r, f"{Path(f).stem}/signed"):
+            ok_all = False
             continue
         z = np.asarray(r["z_scores"], dtype=float)
         k = r["opt_threshold_z_score"]
@@ -198,7 +221,7 @@ def test_gate_flags_model_independent(files):
         vals = {}
         for variant in ("baseline", "log1p", "harmonics4", "all3"):
             r = uv.run_variant(f, variant)
-            if r["status"] != "success":
+            if not require_success(r, f"{Path(f).stem}/{variant}"):
                 continue
             vals[variant] = tuple(r[c] for c in structural)
         ok = len(set(vals.values())) <= 1
@@ -248,7 +271,7 @@ def test_detection_bands(files):
     for variant in ("baseline", "log1p", "signed", "all3"):
         for f in files:
             res, df = uv.run_variant_with_frame(f, variant)
-            if res["status"] != "success":
+            if not require_success(res, f"{Path(f).stem}/{variant}"):
                 continue
             if "upper_band" not in df.columns:
                 ok_all &= check(f"{Path(f).stem}/{variant}: bands emitted", False)
@@ -294,7 +317,7 @@ def test_viz_helpers(files):
     for variant in ("baseline", "signed", "log1p"):
         for f in files:
             res, df = uv.run_variant_with_frame(f, variant)
-            if res["status"] != "success":
+            if not require_success(res, f"{Path(f).stem}/{variant}"):
                 continue
             d = vz.recompute_at_threshold(
                 df, res["opt_threshold_z_score"], res["opt_signed_bands"],
@@ -311,6 +334,207 @@ def test_viz_helpers(files):
 
     p, r, f1 = vz.prf(5, 5, 5)
     check("vz.prf matches expectation", np.isclose(p, 0.5) and np.isclose(f1, 0.5))
+    return ok_all
+
+
+
+# ============================================================================
+# SUSTAINED-ANOMALY HARNESS
+# ============================================================================
+
+
+def test_injection_mechanics():
+    """Injectors must be exact on the cumulative series and honest about labels."""
+    print("\n[10] injection mechanics")
+    n = 200
+    ts = pd.date_range("2024-03-01", periods=n, freq="h", tz="UTC")
+    diff = np.abs(np.sin(np.arange(n) / 3.8)) * 0.05 + 0.01
+    df = pd.DataFrame({
+        "timestamp_utc": ts,
+        "hodnota": np.cumsum(diff) + 1000.0,
+        "Diff": diff,
+    })
+    rng_seed = 7
+    scale = ai.sensor_scale(diff)
+    check("sensor_scale is the median non-zero Diff",
+          np.isclose(scale, float(np.median(diff[diff > 0]))))
+
+    # apply_delta must keep hodnota and Diff mutually consistent, INCLUDING row
+    # 0 — the row whose Diff came from outside this slice.
+    delta = np.zeros(n)
+    delta[50:] = 0.3
+    out = ai.apply_delta(df, delta)
+    recon = np.diff(out["hodnota"].values)
+    check("apply_delta: Diff matches hodnota.diff() on rows 1..n",
+          np.allclose(recon, out["Diff"].values[1:], atol=1e-9))
+    check("apply_delta: row 0 Diff preserved when untouched",
+          np.isclose(out["Diff"].values[0], df["Diff"].values[0]))
+    check("apply_delta: rows before the delta are unchanged",
+          np.allclose(out["Diff"].values[:50], df["Diff"].values[:50]))
+
+    ok_all = True
+    for arch in sorted(ai.ARCHETYPES):
+        plan = ai.InjectionPlan(archetype=arch, depth=2.0, duration_h=12.0)
+        inj, events = ai.apply_injection_plan(
+            plan=plan, df=df, scale=scale, periodicity_seconds=3600, seed=rng_seed)
+
+        # Cumulative series must stay non-decreasing: none of these archetypes
+        # is a meter rollback, so a negative step would mean a broken injector.
+        h = inj["hodnota"].values
+        h = h[np.isfinite(h)]
+        mono = bool(np.all(np.diff(h) >= -ai.NEG_DIFF_TOL))
+        ok_all &= check(f"{arch}: cumulative series stays non-decreasing", mono)
+
+        # Labels must line up with the intervals the injector reported.
+        lbl, ids = em.label_rows_from_events(inj["timestamp_utc"].values, events)
+        if events:
+            span = sum(
+                int(((pd.to_datetime(inj["timestamp_utc"].values, utc=True) >= pd.Timestamp(e.t_start))
+                     & (pd.to_datetime(inj["timestamp_utc"].values, utc=True) <= pd.Timestamp(e.t_end))).sum())
+                for e in events)
+            ok_all &= check(f"{arch}: label count == interval span",
+                            int(lbl.sum()) == span, f"{int(lbl.sum())} vs {span}")
+        else:
+            ok_all &= check(f"{arch}: unlabelled probe emits no labels",
+                            int(lbl.sum()) == 0)
+
+    # The two probes must be label-free / injection-free respectively.
+    _, ev_h = ai.apply_injection_plan(
+        plan=ai.InjectionPlan("holiday_profile", duration_h=24.0),
+        df=df, scale=scale, periodicity_seconds=3600, seed=rng_seed)
+    check("holiday_profile is an unlabelled FP probe", ev_h == [])
+
+    inj_n, ev_n = ai.apply_injection_plan(
+        plan=ai.InjectionPlan("null_control", duration_h=24.0),
+        df=df, scale=scale, periodicity_seconds=3600, seed=rng_seed)
+    check("null_control labels an interval", len(ev_n) == 1)
+    check("null_control leaves the data untouched",
+          np.allclose(inj_n["Diff"].values, df["Diff"].values, equal_nan=True)
+          and np.allclose(inj_n["hodnota"].values, df["hodnota"].values, equal_nan=True))
+
+    # Depth must be monotone in effect, or the surface's x-axis is meaningless.
+    tot = []
+    for depth in (0.1, 1.0, 10.0):
+        inj_d, _ = ai.apply_injection_plan(
+            plan=ai.InjectionPlan("slow_leak", depth=depth, duration_h=24.0),
+            df=df, scale=scale, periodicity_seconds=3600, seed=rng_seed)
+        tot.append(float(np.nansum(inj_d["Diff"].values)))
+    check("slow_leak volume increases with depth",
+          tot[0] < tot[1] < tot[2], f"{[round(t, 3) for t in tot]}")
+
+    # frozen_meter must actually flatten consumption.
+    inj_f, ev_f = ai.apply_injection_plan(
+        plan=ai.InjectionPlan("frozen_meter", duration_h=24.0),
+        df=df, scale=scale, periodicity_seconds=3600, seed=rng_seed)
+    lbl_f, _ = em.label_rows_from_events(inj_f["timestamp_utc"].values, ev_f)
+    inside = lbl_f == 1
+    check("frozen_meter zeroes Diff inside the window",
+          np.allclose(np.nan_to_num(inj_f["Diff"].values[inside]), 0.0, atol=1e-9))
+    return ok_all
+
+
+def test_event_metrics():
+    """Event-level scoring must be right on hand-built cases."""
+    print("\n[11] event metrics")
+    n = 100
+    ts = pd.date_range("2024-03-01", periods=n, freq="h", tz="UTC")
+    ev = [ai.AnomalyEvent(archetype="slow_leak", t_start=ts[20], t_end=ts[39],
+                          depth=1.0, duration_h=20.0, scale=1.0)]
+
+    lbl, ids = em.label_rows_from_events(ts, ev)
+    check("labels cover exactly the interval",
+          int(lbl.sum()) == 20 and lbl[20] == 1 and lbl[39] == 1
+          and lbl[19] == 0 and lbl[40] == 0)
+
+    # Detected on the 6th reading of the event.
+    flags = np.zeros(n, dtype=bool)
+    flags[25] = True
+    df_ev = em.event_level_metrics(ts, flags, ev, periodicity_seconds=3600)
+    check("event detected", bool(df_ev.loc[0, "detected"]))
+    check("time-to-detect measured from event start",
+          df_ev.loc[0, "ttd_readings"] == 5, f'{df_ev.loc[0, "ttd_readings"]}')
+    check("time-to-detect in hours", np.isclose(df_ev.loc[0, "ttd_hours"], 5.0))
+
+    # A flag OUTSIDE the event is a false alarm, not a detection.
+    flags2 = np.zeros(n, dtype=bool)
+    flags2[80] = True
+    df_ev2 = em.event_level_metrics(ts, flags2, ev, periodicity_seconds=3600)
+    check("flag outside the event is not a detection",
+          not bool(df_ev2.loc[0, "detected"]))
+    fp, n_clean = em.false_alarm_count(ts, flags2, ev)
+    check("false alarm counted outside events", fp == 1 and n_clean == 80)
+    check("missed event reports NaN ttd, not a sentinel",
+          bool(np.isnan(df_ev2.loc[0, "ttd_readings"])))
+
+    # Recovery: still alarming after the event ends.
+    flags3 = np.zeros(n, dtype=bool)
+    flags3[25] = True
+    flags3[41] = True
+    rec = em.recovery_check(ts, flags3, ev, n_after=12)
+    check("recovery flagged as unclean when alarms persist",
+          not bool(rec.loc[0, "clean"]))
+    rec2 = em.recovery_check(ts, flags, ev, n_after=12)
+    check("recovery clean when detector settles", bool(rec2.loc[0, "clean"]))
+    return not _FAIL
+
+
+def test_null_control_correction():
+    """The surface must report excess over the null floor, not the raw rate."""
+    print("\n[12] null-control correction")
+    import run_sustained as rs
+
+    surf = pd.DataFrame({
+        "archetype": ["null_control", "slow_leak", "slow_leak"],
+        "depth": [np.nan, 0.1, 10.0],
+        "duration_h": [24.0, 24.0, 24.0],
+        "n_events": [3, 3, 3],
+        "detection_rate": [0.333333, 0.333333, 1.0],
+        "ttd_readings_median": [21.0, 21.0, 1.0],
+    })
+    out = rs._apply_null_correction(surf)
+    row_low = out[(out.archetype == "slow_leak") & (out.depth == 0.1)].iloc[0]
+    row_high = out[(out.archetype == "slow_leak") & (out.depth == 10.0)].iloc[0]
+
+    check("coincidental detection nets to zero excess",
+          np.isclose(row_low["excess_detection_rate"], 0.0),
+          f'raw={row_low["detection_rate"]:.3f} null={row_low["null_rate"]:.3f}')
+    check("genuine detection survives the correction",
+          np.isclose(row_high["excess_detection_rate"], 1.0 - 1 / 3))
+    check("excess is never negative",
+          bool((out["excess_detection_rate"].fillna(0) >= 0).all()))
+    check("null_control row has no excess of its own",
+          bool(np.isnan(out[out.archetype == "null_control"].iloc[0]["excess_detection_rate"])))
+    return not _FAIL
+
+
+def test_injection_is_read_only(files):
+    """Injection changes only the DATA, never the scoring path.
+
+    A run with `injection_plan=None` must be identical to the pre-existing
+    behaviour, and the fixture CSVs on disk must never be written to.
+    """
+    print("\n[13] injection does not alter the scoring path")
+    ok_all = True
+    for f in files:
+        name = Path(f).stem
+        before = Path(f).read_bytes()
+
+        a = uv.run_variant(f, "baseline")
+        b = uv.run_variant(f, "baseline", injection_plan=None)
+        if not (require_success(a, f"{name}/plain") and require_success(b, f"{name}/none")):
+            ok_all = False
+            continue
+        za = np.asarray(a["z_scores"], dtype=float)
+        zb = np.asarray(b["z_scores"], dtype=float)
+        ok_all &= check(f"{name}: injection_plan=None is a no-op",
+                        za.shape == zb.shape and np.allclose(za, zb, equal_nan=True,
+                                                             rtol=0, atol=0))
+        # A run with a plan must not touch the source file.
+        uv.run_variant(f, "baseline",
+                       injection_plan=ai.InjectionPlan("slow_leak", depth=1.0,
+                                                       duration_h=24.0))
+        ok_all &= check(f"{name}: fixture CSV unmodified on disk",
+                        Path(f).read_bytes() == before)
     return ok_all
 
 
@@ -334,6 +558,10 @@ def main():
     test_analysis_layer(files)
     test_detection_bands(files)
     test_viz_helpers(files)
+    test_injection_mechanics()
+    test_event_metrics()
+    test_null_control_correction()
+    test_injection_is_read_only(files)
 
     print(f"\n{'=' * 60}")
     print(f"passed: {len(_PASS)}   failed: {len(_FAIL)}")

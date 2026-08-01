@@ -71,6 +71,8 @@ from local_level_unobserved_components_next_one_step_pred import (  # noqa: F401
 
 from helper_scripts.calculate_metrics import calculate_metrics
 from helper_scripts.create_anomalies import inject_spike_anomalies_diff
+from helper_scripts import anomaly_injection as ai
+from helper_scripts import event_metrics as em
 from helper_scripts.series_diagnostics import (
     compute_intermittency,
     compute_seasonal_diagnostics,
@@ -276,7 +278,9 @@ def predict_model_online(df_predict, result, freq_seasonal, stochastic_freq_seas
             x_prior = T @ x
             P_prior = T @ P @ T.T + Q_full
 
-            y_hat = float(Z @ x_prior)
+            # .item() not float(): Z @ x_prior has shape (1,), and NumPy >= 2
+            # refuses float() on any non-0-d array. Value-identical.
+            y_hat = (Z @ x_prior).item()
             # Valid in both spaces: raw Diff >= 0, and log1p(Diff/s) >= 0 too.
             predictions[t] = max(y_hat, 0.0)
 
@@ -307,7 +311,7 @@ def predict_model_online(df_predict, result, freq_seasonal, stochastic_freq_seas
                 x = x_prior
                 P = P_prior
             else:
-                S = float(Z @ P_prior @ Z.T + H)
+                S = (Z @ P_prior @ Z.T + H).item()
                 K = (P_prior @ Z.T) / S
                 innovation = y_t - y_hat
                 x = x_prior + K.flatten() * innovation
@@ -519,12 +523,19 @@ def process_single_meter(
     variant="baseline",
     verbose=False,
     return_predictions=False,
+    injection_plan=None,
 ):
     """Run one meter end-to-end under a given variant configuration.
 
     Defaults (`transform="raw"`, `harmonics_daily_max=None`, `signed_bands=False`,
-    `mask_z_threshold=None` -> equals detection threshold) reproduce the
-    baseline script exactly.
+    `mask_z_threshold=None` -> equals detection threshold, `injection_plan=None`
+    -> the original spike injector) reproduce the baseline script exactly.
+
+    `injection_plan` is an `anomaly_injection.InjectionPlan` selecting one
+    sustained archetype at a given depth and duration. It replaces the spike
+    injector for that run and adds event-level results (`n_events`,
+    `event_recall`, `ttd_*`, `recovery_clean`) to the returned dict. It changes
+    only what is fed in, never how scoring works.
     """
     if mask_z_threshold is None:
         mask_z_threshold = threshold_z_score
@@ -623,9 +634,37 @@ def process_single_meter(
             second_residuals = np.abs(second_actual_s - second_pred_s)
 
         # ---- inject anomalies (RAW space, before transform) ------------------
-        df_predict = inject_spike_anomalies_diff(
-            df_predict, random_state=int(result['filename'])
-        )
+        # Same point in the flow as before: after the calibration residuals are
+        # fixed, before the transform and the online pass. `injection_plan=None`
+        # keeps the original spike injector verbatim, which is what makes the
+        # baseline-equivalence check in test_uc_variants.py still meaningful.
+        #
+        # The sustained injectors need the sensor's own scale. It is taken from
+        # the CALIBRATION segment, never from df_predict — deriving it from the
+        # segment about to be injected into would let the anomaly set its own
+        # magnitude unit. Same reasoning as the log1p transform's scale.
+        injected_events = []
+        if injection_plan is None:
+            df_predict = inject_spike_anomalies_diff(
+                df_predict, random_state=int(result['filename'])
+            )
+        else:
+            inj_scale = ai.sensor_scale(df_second["Diff"].values)
+            result["injection_scale"] = float(inj_scale)
+            df_predict, injected_events = ai.apply_injection_plan(
+                df_predict, injection_plan,
+                scale=inj_scale,
+                periodicity_seconds=periodicity_seconds,
+                seed=int(result['filename']),
+            )
+            # Interval labels -> the same per-row column calculate_metrics()
+            # already consumes, so point-wise scoring is unaffected.
+            lbl, _ = em.label_rows_from_events(
+                df_predict["timestamp_utc"].values, injected_events
+            )
+            df_predict = df_predict.copy()
+            df_predict["is_anomaly"] = lbl.astype(float)
+
         df_predict_s = _transformed(df_predict, tf)
 
         # ---- online prediction ----------------------------------------------
@@ -661,6 +700,42 @@ def process_single_meter(
         # be recomputed post-hoc — the sweep costs no re-runs.
         result["z_scores"] = predictions_df["z_score"].tolist()
         result["labels"] = predictions_df["is_anomaly_actual"].tolist()
+
+        # ---- event-level results (only when a sustained plan was injected) ---
+        # Point-wise recall treats a caught 48h leak as ~96% misses; event recall
+        # and time-to-detect are what actually separate detectors here. Both
+        # views come from the same run — nothing point-wise is displaced.
+        if injected_events:
+            ev_summary, ev_df = em.summarize_run(
+                predictions_df["timestamp_utc"].values,
+                predictions_df["is_anomaly_predicted"].values.astype(bool),
+                injected_events,
+                periodicity_seconds=periodicity_seconds,
+            )
+            result.update(ev_summary)
+            result["events"] = [e.to_row() for e in injected_events]
+            result["event_rows"] = ev_df.to_dict("records")
+            result["injection_archetype"] = injection_plan.archetype
+            result["injection_depth"] = float(injection_plan.depth)
+            result["injection_duration_h"] = float(injection_plan.duration_h)
+        elif injection_plan is not None:
+            # holiday_profile injects a shape change but labels nothing, so an
+            # empty event list is the expected outcome, not a failure. Its FP
+            # count is the entire point of the probe, so it is still recorded —
+            # with no events, every flagged reading is by definition outside one.
+            fp_out, n_clean = em.false_alarm_count(
+                predictions_df["timestamp_utc"].values,
+                predictions_df["is_anomaly_predicted"].values.astype(bool),
+                [],
+            )
+            result["n_events"] = 0
+            result["event_recall"] = np.nan
+            result["fp_outside_events"] = fp_out
+            result["n_clean_readings"] = n_clean
+            result["recovery_clean"] = True   # no event to recover from
+            result["injection_archetype"] = injection_plan.archetype
+            result["injection_depth"] = float(injection_plan.depth)
+            result["injection_duration_h"] = float(injection_plan.duration_h)
 
         # ---- diagnostics: always RAW, so gate booleans mean the same thing ---
         second_diff = np.asarray(df_second["Diff"].values, dtype=float)
