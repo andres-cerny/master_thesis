@@ -237,6 +237,83 @@ def test_analysis_layer(files):
     return True
 
 
+def test_detection_bands(files):
+    """The drawn envelope must agree with the flags, at the run's own threshold
+    and at any other. If it does not, the notebook plots misrepresent the
+    detector."""
+    print("\n[8] detection bands agree with flags")
+    import variant_viz as vz
+
+    ok_all = True
+    for variant in ("baseline", "log1p", "signed", "all3"):
+        for f in files:
+            res, df = uv.run_variant_with_frame(f, variant)
+            if res["status"] != "success":
+                continue
+            if "upper_band" not in df.columns:
+                ok_all &= check(f"{Path(f).stem}/{variant}: bands emitted", False)
+                continue
+
+            ordered = bool((df["upper_band"] >= df["lower_band"]).all())
+            flag = df["is_anomaly_predicted"].to_numpy(int) == 1
+            outside = ((df["actual"] > df["upper_band"]) |
+                       (df["actual"] < df["lower_band"])).to_numpy()
+            ok_all &= check(f"{Path(f).stem}/{variant}: bands match flags",
+                            ordered and bool(np.array_equal(flag, outside)))
+
+            # Recomputing at a different threshold must keep them consistent.
+            for k in (2.5, 5.0):
+                d2 = vz.recompute_at_threshold(
+                    df, k, res["opt_signed_bands"],
+                    res["transform"], res.get("transform_scale_used", 1.0))
+                f2 = d2["is_anomaly_predicted"].to_numpy(int) == 1
+                o2 = ((d2["actual"] > d2["upper_band"]) |
+                      (d2["actual"] < d2["lower_band"])).to_numpy()
+                if not np.array_equal(f2, o2):
+                    ok_all &= check(
+                        f"{Path(f).stem}/{variant}: consistent at z={k}", False)
+            # A stricter threshold can never flag more.
+            lo = vz.recompute_at_threshold(df, 2.5, res["opt_signed_bands"],
+                                           res["transform"],
+                                           res.get("transform_scale_used", 1.0))
+            hi = vz.recompute_at_threshold(df, 5.0, res["opt_signed_bands"],
+                                           res["transform"],
+                                           res.get("transform_scale_used", 1.0))
+            ok_all &= check(
+                f"{Path(f).stem}/{variant}: monotone in threshold",
+                int(hi["is_anomaly_predicted"].sum()) <= int(lo["is_anomaly_predicted"].sum()))
+    return ok_all
+
+
+def test_viz_helpers(files):
+    """Threshold recomputation must reproduce the run's own stored counts."""
+    print("\n[9] viz helpers")
+    import variant_viz as vz
+
+    ok_all = True
+    for variant in ("baseline", "signed", "log1p"):
+        for f in files:
+            res, df = uv.run_variant_with_frame(f, variant)
+            if res["status"] != "success":
+                continue
+            d = vz.recompute_at_threshold(
+                df, res["opt_threshold_z_score"], res["opt_signed_bands"],
+                res["transform"], res.get("transform_scale_used", 1.0))
+            c = vz.confusion_counts(d)
+            ok = (c["tp"] == res["metric_pred_tp"]
+                  and c["fp"] == res["metric_pred_fp"])
+            ok_all &= ok
+            if not ok:
+                check(f"{Path(f).stem}/{variant}: recompute == stored", False,
+                      f"{c} vs tp={res['metric_pred_tp']} fp={res['metric_pred_fp']}")
+    if ok_all:
+        check("recompute at native threshold reproduces stored counts", True)
+
+    p, r, f1 = vz.prf(5, 5, 5)
+    check("vz.prf matches expectation", np.isclose(p, 0.5) and np.isclose(f1, 0.5))
+    return ok_all
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--fixtures", default=DEFAULT_FIXTURES)
@@ -255,6 +332,8 @@ def main():
     test_signed_semantics(files)
     test_gate_flags_model_independent(files)
     test_analysis_layer(files)
+    test_detection_bands(files)
+    test_viz_helpers(files)
 
     print(f"\n{'=' * 60}")
     print(f"passed: {len(_PASS)}   failed: {len(_FAIL)}")

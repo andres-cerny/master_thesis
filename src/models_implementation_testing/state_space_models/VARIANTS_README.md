@@ -11,6 +11,8 @@ quality** — separately, and honestly enough to act on.
 | `uc_variants.py` | Parameterized model. Imports the unchanged machinery from `local_level_unobserved_components_next_one_step_pred.py` and overrides only `predict_model_online`, `build_results_df`, `process_single_meter`. |
 | `run_variants.py` | Batch runner → `summary.csv` + `scores.parquet`. |
 | `analyze_variants.py` | Post-hoc slider/aggregation. No re-runs. |
+| `variant_viz.py` | Plotting + threshold-recompute helpers used by the notebook. |
+| `compare_variants.ipynb` | Visual comparison: per-sensor time series, confusion matrices, histograms, adjustable threshold. |
 | `test_uc_variants.py` | Verification suite. **Run this first.** |
 
 The two thesis scripts (`..._next_one_step_pred.py`, `..._z_floor.py`) are
@@ -19,7 +21,7 @@ untouched and remain reproducible.
 ## Quick start
 
 ```bash
-python test_uc_variants.py                         # 27 checks, must be green
+python test_uc_variants.py                         # must be green
 
 python run_variants.py \
     --data-dir ../../../data/sensor_data \
@@ -29,7 +31,13 @@ python run_variants.py \
 python analyze_variants.py --results ./results/testset --prod-gates --sweep --bootstrap
 ```
 
-`pyarrow` is optional — without it the runner falls back to `scores.csv.gz`.
+For visual inspection open `compare_variants.ipynb` and edit the config cell
+(`FIXTURES_DIR`, `VARIANTS`, `Z_THRESHOLD`, `SENSOR`), then Run All. It defaults
+to the three bundled fixtures and takes about a minute on them.
+
+Optional deps: `pyarrow` (else the runner falls back to `scores.csv.gz`) and
+`ipywidgets` (else the notebook's threshold control renders statically instead
+of as a slider). Neither is required.
 
 ## Variants
 

@@ -141,6 +141,7 @@ def build_transform(kind, df_calibration, result):
     if kind in (None, "raw"):
         result["signal_scale"] = np.nan
         result["transform"] = "raw"
+        result["transform_scale_used"] = 1.0
         return RawSpace()
 
     if kind != "log1p_scaled":
@@ -329,12 +330,18 @@ def build_results_df(df_predict_raw, predictions_scoring, transform, result,
                      ref_residuals=None, ref_timestamps=None,
                      periodicity_seconds=None, daily_period_steps=None,
                      k_positions=None, threshold_z_score=3.5,
-                     signed_bands=False):
+                     signed_bands=False, save_detection_bands=False):
     """Assemble the per-reading frame.
 
     `actual` / `predicted` / `residual` are emitted in RAW units so that MAE,
     RMSE and MASE remain comparable across variants; `z_score` is computed in
     scoring space, which is where the transform is supposed to help.
+
+    With `save_detection_bands=True` the frame also carries `upper_band` /
+    `lower_band` in RAW units, for plotting. The bands are derived in SCORING
+    space and then pushed through `transform.inv`, which is monotone, so the
+    drawn envelope is exactly the region the detector treats as normal — under
+    a log transform it is visibly asymmetric in raw units, which is the point.
     """
     actual_raw = np.asarray(df_predict_raw["Diff"].values, dtype=float)
     timestamps = pd.to_datetime(df_predict_raw["timestamp_utc"].values, utc=True)
@@ -381,7 +388,7 @@ def build_results_df(df_predict_raw, predictions_scoring, transform, result,
     else:
         pred_positions = ref_positions = None
 
-    z_score, _, _, _, _, _ = base.compute_z_scores(
+    z_score, _, mu_used, sd_used, _, _ = base.compute_z_scores(
         residual_scoring,
         result,
         ref_residuals=ref_residuals,
@@ -393,6 +400,28 @@ def build_results_df(df_predict_raw, predictions_scoring, transform, result,
 
     result_df["z_score"] = z_score
     result_df["is_anomaly_actual"] = anomalies
+
+    if save_detection_bands:
+        # Retained so the bands can be RECOMPUTED at any threshold without
+        # re-running the model — this is what makes the notebook's threshold
+        # control honest rather than just re-colouring the markers.
+        result_df["predicted_scoring"] = predicted_scoring
+        result_df["band_mu"] = mu_used
+        result_df["band_sd"] = sd_used
+
+        # Half-width of the acceptance region, in scoring space.
+        half = mu_used + threshold_z_score * sd_used
+        if signed_bands:
+            # Upper-only: the acceptance region is everything below the upper
+            # bound, so the floor is simply 0 (Diff is non-negative). Drawing a
+            # lower boundary here would imply a test that is not being applied.
+            upper_scoring = predicted_scoring + half
+            lower_scoring = np.zeros_like(upper_scoring)
+        else:
+            upper_scoring = predicted_scoring + half
+            lower_scoring = predicted_scoring - half
+        result_df["upper_band"] = transform.inv(upper_scoring)
+        result_df["lower_band"] = np.clip(transform.inv(lower_scoring), 0.0, None)
 
     # Upper-only when signed: every injected anomaly is a positive excursion, so
     # the lower tail can only contribute false positives. Note this changes what
@@ -489,6 +518,7 @@ def process_single_meter(
     min_k_positions=2,
     variant="baseline",
     verbose=False,
+    return_predictions=False,
 ):
     """Run one meter end-to-end under a given variant configuration.
 
@@ -624,6 +654,7 @@ def process_single_meter(
             k_positions=k_positions,
             threshold_z_score=threshold_z_score,
             signed_bands=signed_bands,
+            save_detection_bands=return_predictions,
         )
 
         # Stored WITH labels so precision/recall at any detection threshold can
@@ -680,6 +711,9 @@ def process_single_meter(
             result[f"metric_{key}"] = value
 
         result["status"] = "success"
+        if return_predictions:
+            # Kept out of `result` so the batch runner's summary row stays flat.
+            result["_predictions_df"] = predictions_df
         return result
 
     except Exception as e:
@@ -717,3 +751,15 @@ def run_variant(csv_filepath, variant, **overrides):
     kwargs = dict(VARIANTS[variant])
     kwargs.update(overrides)
     return process_single_meter(csv_filepath, variant=variant, **kwargs)
+
+
+def run_variant_with_frame(csv_filepath, variant, **overrides):
+    """Run one meter and return `(result, predictions_df)`.
+
+    The frame carries per-reading actual/predicted/z_score/labels plus
+    `upper_band` / `lower_band` in raw units — everything the inspection
+    notebook needs to draw a single sensor's week.
+    """
+    overrides.setdefault("return_predictions", True)
+    res = run_variant(csv_filepath, variant, **overrides)
+    return res, res.pop("_predictions_df", None)
